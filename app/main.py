@@ -28,15 +28,28 @@ DB_PATH = Path(os.getenv("DB_PATH", str(DATA_DIR / "pkgmng.db")))
 REFRESH_INTERVAL_MINUTES = int(os.getenv("REFRESH_INTERVAL_MINUTES", "360"))
 APT_REPOS = os.getenv(
     "APT_REPOS",
-    "debian-bookworm|https://deb.debian.org/debian|bookworm|main,"
-    "debian-security|https://security.debian.org/debian-security|bookworm-security|main",
+    "debian-13-main|https://deb.debian.org/debian|trixie|main,"
+    "debian-12-main|https://deb.debian.org/debian|bookworm|main,"
+    "debian-11-main|https://deb.debian.org/debian|bullseye|main,"
+    "debian-13-security|https://security.debian.org/debian-security|trixie-security|main,"
+    "debian-12-security|https://security.debian.org/debian-security|bookworm-security|main,"
+    "debian-11-security|https://security.debian.org/debian-security|bullseye-security|main",
 )
 RPM_REPOS = os.getenv(
     "RPM_REPOS",
+    "alma-10-baseos|https://repo.almalinux.org/almalinux/10/BaseOS/x86_64/os/|AlmaLinux 10|BaseOS,"
     "alma-9-baseos|https://repo.almalinux.org/almalinux/9/BaseOS/x86_64/os/|AlmaLinux 9|BaseOS,"
+    "alma-8-baseos|https://repo.almalinux.org/almalinux/8/BaseOS/x86_64/os/|AlmaLinux 8|BaseOS,"
+    "rocky-10-baseos|https://dl.rockylinux.org/pub/rocky/10/BaseOS/x86_64/os/|Rocky Linux 10|BaseOS,"
     "rocky-9-baseos|https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/|Rocky Linux 9|BaseOS,"
+    "rocky-8-baseos|https://dl.rockylinux.org/pub/rocky/8/BaseOS/x86_64/os/|Rocky Linux 8|BaseOS,"
+    "oracle-10-baseos|https://yum.oracle.com/repo/OracleLinux/OL10/baseos/latest/x86_64/|Oracle Linux 10|BaseOS,"
     "oracle-9-baseos|https://yum.oracle.com/repo/OracleLinux/OL9/baseos/latest/x86_64/|Oracle Linux 9|BaseOS,"
-    "redhat-ubi9-baseos|https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/|Red Hat UBI 9|BaseOS",
+    "oracle-8-baseos|https://yum.oracle.com/repo/OracleLinux/OL8/baseos/latest/x86_64/|Oracle Linux 8|BaseOS,"
+    "oracle-7-latest|https://yum.oracle.com/repo/OracleLinux/OL7/latest/x86_64/|Oracle Linux 7|Latest,"
+    "redhat-ubi10-baseos|https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi10/10/x86_64/baseos/os/|Red Hat UBI 10|BaseOS,"
+    "redhat-ubi9-baseos|https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/|Red Hat UBI 9|BaseOS,"
+    "redhat-ubi8-baseos|https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi8/8/x86_64/baseos/os/|Red Hat UBI 8|BaseOS",
 )
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))
 MAX_PACKAGES_PER_REPO = int(os.getenv("MAX_PACKAGES_PER_REPO", "2500"))
@@ -77,6 +90,20 @@ class Repo:
             return "Debian Security"
         return "Debian"
 
+    @property
+    def release_version(self) -> str:
+        value = f"{self.name} {self.suite} {self.base_url}"
+        if self.repo_type == "apt":
+            debian_versions = {"trixie": "13", "bookworm": "12", "bullseye": "11"}
+            for codename, version in debian_versions.items():
+                if codename in value.lower():
+                    return version
+        match = re.search(r"(?:ubi|ol|linux|alma|rocky|debian)[^\d]*(10|9|8|7|13|12|11)\b", value, re.I)
+        if match:
+            return match.group(1)
+        match = re.search(r"/(?:OL|ubi)?(10|9|8|7|13|12|11)(?:/|$)", value, re.I)
+        return match.group(1) if match else ""
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -112,6 +139,7 @@ def init_db() -> None:
               name TEXT PRIMARY KEY,
               repo_type TEXT NOT NULL DEFAULT 'apt',
               distro_family TEXT NOT NULL DEFAULT 'Debian',
+              release_version TEXT NOT NULL DEFAULT '',
               base_url TEXT NOT NULL,
               suite TEXT NOT NULL,
               component TEXT NOT NULL,
@@ -145,20 +173,36 @@ def init_db() -> None:
         )
         ensure_column(conn, "repos", "repo_type", "TEXT NOT NULL DEFAULT 'apt'")
         ensure_column(conn, "repos", "distro_family", "TEXT NOT NULL DEFAULT 'Debian'")
+        ensure_column(conn, "repos", "release_version", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "packages", "package_format", "TEXT NOT NULL DEFAULT 'deb'")
-        for repo in configured_repos():
+        repos = configured_repos()
+        repo_names = [repo.name for repo in repos]
+        if repo_names:
+            placeholders = ",".join("?" for _ in repo_names)
+            conn.execute(f"DELETE FROM packages WHERE repo_name NOT IN ({placeholders})", repo_names)
+            conn.execute(f"DELETE FROM repos WHERE name NOT IN ({placeholders})", repo_names)
+        for repo in repos:
             conn.execute(
                 """
-                INSERT INTO repos(name, repo_type, distro_family, base_url, suite, component)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO repos(name, repo_type, distro_family, release_version, base_url, suite, component)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                   repo_type=excluded.repo_type,
                   distro_family=excluded.distro_family,
+                  release_version=excluded.release_version,
                   base_url=excluded.base_url,
                   suite=excluded.suite,
                   component=excluded.component
                 """,
-                (repo.name, repo.repo_type, repo.distro_family, repo.base_url, repo.suite, repo.component),
+                (
+                    repo.name,
+                    repo.repo_type,
+                    repo.distro_family,
+                    repo.release_version,
+                    repo.base_url,
+                    repo.suite,
+                    repo.component,
+                ),
             )
         conn.commit()
 
@@ -437,7 +481,7 @@ def api_repos() -> list[dict[str, Any]]:
 @app.get("/api/families")
 def api_families() -> list[dict[str, Any]]:
     with closing(connect_db()) as conn:
-        return [
+        families = [
             dict(row)
             for row in conn.execute(
                 """
@@ -454,6 +498,70 @@ def api_families() -> list[dict[str, Any]]:
                 """
             )
         ]
+        version_rows = conn.execute(
+            """
+            SELECT
+              distro_family,
+              release_version,
+              COUNT(*) repos,
+              SUM(package_count) packages,
+              SUM(status='ok') healthy,
+              SUM(status='error') errors
+            FROM repos
+            WHERE release_version != ''
+            GROUP BY distro_family, release_version
+            """
+        ).fetchall()
+    versions_by_family: dict[str, list[dict[str, Any]]] = {}
+    for row in version_rows:
+        versions_by_family.setdefault(row["distro_family"], []).append(dict(row))
+    for family in families:
+        versions = versions_by_family.get(family["distro_family"], [])
+        family["versions"] = latest_versions(versions)
+        family["version_count"] = len(family["versions"])
+    return families
+
+
+@app.get("/api/versions")
+def api_versions() -> list[dict[str, Any]]:
+    with closing(connect_db()) as conn:
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT
+                  distro_family,
+                  release_version,
+                  repo_type,
+                  COUNT(*) repos,
+                  SUM(package_count) packages,
+                  SUM(status='ok') healthy,
+                  SUM(status='error') errors
+                FROM repos
+                WHERE release_version != ''
+                GROUP BY distro_family, release_version, repo_type
+                """
+            )
+        ]
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        family = grouped.setdefault(
+            row["distro_family"],
+            {"distro_family": row["distro_family"], "repo_type": row["repo_type"], "versions": []},
+        )
+        family["versions"].append(row)
+    return [
+        {**family, "versions": latest_versions(family["versions"])}
+        for family in sorted(grouped.values(), key=lambda item: (item["repo_type"], item["distro_family"]))
+    ]
+
+
+def latest_versions(rows: list[dict[str, Any]], limit: int = 5) -> list[dict[str, Any]]:
+    def sort_key(row: dict[str, Any]) -> tuple[int, str]:
+        version = str(row.get("release_version") or "")
+        return (int(version) if version.isdigit() else -1, version)
+
+    return sorted(rows, key=sort_key, reverse=True)[:limit]
 
 
 @app.get("/api/packages")
@@ -461,6 +569,7 @@ def api_packages(
     q: str = "",
     status: str = Query("", pattern="^(|passed|review|failed)$"),
     family: str = "",
+    version: str = "",
     limit: int = Query(200, ge=1, le=1000),
 ) -> dict[str, Any]:
     where: list[str] = []
@@ -474,8 +583,11 @@ def api_packages(
     if family:
         where.append("repos.distro_family = ?")
         args.append(family)
+    if version:
+        where.append("repos.release_version = ?")
+        args.append(version)
     sql = """
-        SELECT packages.*, repos.distro_family
+        SELECT packages.*, repos.distro_family, repos.release_version
         FROM packages
         JOIN repos ON repos.name = packages.repo_name
     """
@@ -546,7 +658,7 @@ def dashboard_html() -> str:
     .section-head { display:flex; align-items:end; justify-content:space-between; gap:18px; margin:24px 0 16px; }
     h2 { margin:0; font-size:clamp(24px,3vw,42px); line-height:1; letter-spacing:0; }
     .muted { color: var(--muted); }
-    .toolbar { display:grid; grid-template-columns:minmax(240px,1fr) 170px 210px; gap:12px; align-items:center; margin:16px 0; }
+    .toolbar { display:grid; grid-template-columns:minmax(240px,1fr) 170px 210px 170px; gap:12px; align-items:center; margin:16px 0; }
     input, select { width:100%; padding:0 14px; }
     .metrics { display:grid; grid-template-columns:repeat(4,minmax(140px,1fr)); gap:12px; }
     .metric { border-radius:24px; padding:7px; background:rgba(16,20,24,.055); animation:rise .8s var(--ease) both; }
@@ -569,6 +681,8 @@ def dashboard_html() -> str:
     .family dl { display:grid; grid-template-columns:1fr 1fr; gap:8px 12px; margin:0; }
     .family dt { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.11em; }
     .family dd { margin:2px 0 0; font-size:22px; font-weight:760; font-variant-numeric:tabular-nums; }
+    .version-strip { display:flex; flex-wrap:wrap; gap:6px; margin-top:14px; }
+    .version-pill { display:inline-flex; align-items:center; min-height:28px; border-radius:999px; padding:4px 9px; background:rgba(16,20,24,.07); color:#27333d; font-size:12px; font-weight:740; }
     .badge { display:inline-flex; align-items:center; border-radius:999px; padding:5px 10px; font-size:12px; font-weight:720; text-transform:uppercase; letter-spacing:.08em; }
     .passed { color:#063f27; background:rgba(8,116,67,.13); }
     .review { color:#62440a; background:rgba(138,100,26,.16); }
@@ -640,7 +754,7 @@ def dashboard_html() -> str:
           <div class="eyebrow">RHEL-family coverage</div>
           <h2>Distribution lanes</h2>
         </div>
-        <p class="muted">RPM metadata from AlmaLinux, Rocky Linux, Oracle Linux, and Red Hat UBI sources is indexed alongside Debian APT data.</p>
+        <p class="muted">Each distribution lane keeps the latest five configured OS releases, capped to the public versions with reachable repository metadata.</p>
       </div>
       <section class="families" id="families" aria-label="Distribution family summary"></section>
       <div class="section-head">
@@ -668,6 +782,9 @@ def dashboard_html() -> str:
         <select id="family" aria-label="Filter by distribution family">
           <option value="">All families</option>
         </select>
+        <select id="version" aria-label="Filter by operating system version">
+          <option value="">All versions</option>
+        </select>
       </div>
       <section class="table-shell" id="packages-table">
         <div class="table-wrap">
@@ -692,8 +809,8 @@ def dashboard_html() -> str:
     async function load() {
       $('packages').innerHTML = skeletonRows();
       try {
-        const params = new URLSearchParams({ q: $('q').value, status: $('status').value, family: $('family').value, limit: '300' });
-        const [repos, families, packages] = await Promise.all([fetch('/api/repos').then(r => r.json()), fetch('/api/families').then(r => r.json()), fetch('/api/packages?' + params).then(r => r.json())]);
+        const params = new URLSearchParams({ q: $('q').value, status: $('status').value, family: $('family').value, version: $('version').value, limit: '300' });
+        const [repos, families, versions, packages] = await Promise.all([fetch('/api/repos').then(r => r.json()), fetch('/api/families').then(r => r.json()), fetch('/api/versions').then(r => r.json()), fetch('/api/packages?' + params).then(r => r.json())]);
         const totals = packages.totals || {};
         $('hero-summary').innerHTML = [
           ['Indexed packages', n(totals.total)],
@@ -705,9 +822,17 @@ def dashboard_html() -> str:
         const familyValue = $('family').value;
         $('family').innerHTML = '<option value="">All families</option>' + families.map(f => `<option value="${esc(f.distro_family)}">${esc(f.distro_family)}</option>`).join('');
         $('family').value = familyValue;
-        $('families').innerHTML = families.length ? families.map(f => `<article class="family" data-family="${esc(f.distro_family)}"><h3><span class="family-dot"></span>${esc(f.distro_family)}</h3><dl><div><dt>Repos</dt><dd>${n(f.repos)}</dd></div><div><dt>Packages</dt><dd>${n(f.packages)}</dd></div><div><dt>Healthy</dt><dd>${n(f.healthy)}</dd></div><div><dt>Errors</dt><dd>${n(f.errors)}</dd></div></dl></article>`).join('') : '<article class="family"><h3><span class="family-dot"></span>No family data</h3></article>';
-        $('repos').innerHTML = repos.length ? repos.map((r, i) => `<article class="repo" style="animation-delay:${i * 70}ms"><div class="repo-core"><h3>${esc(r.name)} <span class="badge ${r.status === 'ok' ? 'passed' : 'failed'}">${esc(r.status)}</span></h3><p><span class="badge pending">${esc(r.distro_family || (r.repo_type || 'apt').toUpperCase())}</span> <span class="badge pending">${esc((r.repo_type || 'apt').toUpperCase())}</span></p><p>${esc(r.base_url)}</p><p>${esc(r.suite)}/${esc(r.component)} - ${n(r.package_count)} packages</p><p>Refreshed ${esc(r.last_refresh || 'never')}</p>${r.error ? `<p class="error">${esc(r.error)}</p>` : ''}</div></article>`).join('') : '<article class="repo"><div class="repo-core"><h3>No repositories configured</h3><p>Add APT_REPOS or RPM_REPOS entries to begin indexing.</p></div></article>';
-        $('packages').innerHTML = packages.packages.length ? packages.packages.map(p => `<tr><td>${esc(p.package)}</td><td>${esc(p.version)}</td><td>${esc(p.repo_name)}</td><td>${esc((p.package_format || 'deb').toUpperCase())}</td><td><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span></td><td>${esc(p.section || '')}</td><td>${esc((p.security_findings || []).join('; ') || 'none')}</td><td class="muted">${esc((p.description || '').split('\\n')[0])}</td></tr>`).join('') : '<tr><td colspan="4"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></td><td colspan="4"></td></tr>';
+        const selectedFamilyVersions = $('family').value ? versions.filter(v => v.distro_family === $('family').value) : versions;
+        const versionValue = $('version').value;
+        const versionOptions = [...new Set(selectedFamilyVersions.flatMap(v => v.versions.map(item => item.release_version)))].sort((a, b) => Number(b) - Number(a));
+        $('version').innerHTML = '<option value="">All versions</option>' + versionOptions.map(v => `<option value="${esc(v)}">${esc(v)}</option>`).join('');
+        $('version').value = versionOptions.includes(versionValue) ? versionValue : '';
+        $('families').innerHTML = families.length ? families.map(f => {
+          const pills = (f.versions || []).map(v => `<span class="version-pill">v${esc(v.release_version)} - ${n(v.packages)} pkgs</span>`).join('');
+          return `<article class="family" data-family="${esc(f.distro_family)}"><h3><span class="family-dot"></span>${esc(f.distro_family)}</h3><dl><div><dt>Repos</dt><dd>${n(f.repos)}</dd></div><div><dt>Versions</dt><dd>${n(f.version_count)}</dd></div><div><dt>Healthy</dt><dd>${n(f.healthy)}</dd></div><div><dt>Errors</dt><dd>${n(f.errors)}</dd></div></dl><div class="version-strip">${pills || '<span class="version-pill">No versions</span>'}</div></article>`;
+        }).join('') : '<article class="family"><h3><span class="family-dot"></span>No family data</h3></article>';
+        $('repos').innerHTML = repos.length ? repos.map((r, i) => `<article class="repo" style="animation-delay:${i * 70}ms"><div class="repo-core"><h3>${esc(r.name)} <span class="badge ${r.status === 'ok' ? 'passed' : 'failed'}">${esc(r.status)}</span></h3><p><span class="badge pending">${esc(r.distro_family || (r.repo_type || 'apt').toUpperCase())}</span> <span class="badge pending">v${esc(r.release_version || 'n/a')}</span> <span class="badge pending">${esc((r.repo_type || 'apt').toUpperCase())}</span></p><p>${esc(r.base_url)}</p><p>${esc(r.suite)}/${esc(r.component)} - ${n(r.package_count)} packages</p><p>Refreshed ${esc(r.last_refresh || 'never')}</p>${r.error ? `<p class="error">${esc(r.error)}</p>` : ''}</div></article>`).join('') : '<article class="repo"><div class="repo-core"><h3>No repositories configured</h3><p>Add APT_REPOS or RPM_REPOS entries to begin indexing.</p></div></article>';
+        $('packages').innerHTML = packages.packages.length ? packages.packages.map(p => `<tr><td>${esc(p.package)}</td><td>${esc(p.version)}</td><td>${esc(p.repo_name)}<br><span class="muted">${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</span></td><td>${esc((p.package_format || 'deb').toUpperCase())}</td><td><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span></td><td>${esc(p.section || '')}</td><td>${esc((p.security_findings || []).join('; ') || 'none')}</td><td class="muted">${esc((p.description || '').split('\\n')[0])}</td></tr>`).join('') : '<tr><td colspan="4"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></td><td colspan="4"></td></tr>';
       } catch (error) {
         $('packages').innerHTML = `<tr><td colspan="7"><div class="state error"><strong>Could not load package data</strong>${esc(error.message || error)}</div></td></tr>`;
       }
@@ -717,6 +842,7 @@ def dashboard_html() -> str:
     $('q').addEventListener('input', () => clearTimeout(window.__t) || (window.__t = setTimeout(load, 250)));
     $('status').addEventListener('change', load);
     $('family').addEventListener('change', load);
+    $('version').addEventListener('change', load);
     load();
   </script>
 </body>

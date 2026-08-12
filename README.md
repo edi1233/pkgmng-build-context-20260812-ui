@@ -8,12 +8,12 @@
 - Port: `8080`
 - Data: SQLite at `DB_PATH`, default `/data/pkgmng.db` in the container
 - Default repositories:
-  - Debian bookworm main
-  - Debian bookworm-security main
-  - AlmaLinux 9 BaseOS
-  - Rocky Linux 9 BaseOS
-  - Oracle Linux 9 BaseOS
-  - Red Hat UBI 9 BaseOS
+  - Debian 13, 12, and 11 main
+  - Debian 13, 12, and 11 security
+  - AlmaLinux 10, 9, and 8 BaseOS
+  - Rocky Linux 10, 9, and 8 BaseOS
+  - Oracle Linux 10, 9, 8, and 7 BaseOS/latest
+  - Red Hat UBI 10, 9, and 8 BaseOS
 
 ## Configuration
 
@@ -35,13 +35,13 @@ debian-bookworm|https://deb.debian.org/debian|bookworm|main,debian-security|http
 name|base_url|distribution_label|repo_label
 ```
 
-Default RHEL-family sources:
+Default RHEL-family sources track the latest public versions with reachable repository metadata, capped at five versions per OS lane:
 
 ```text
-alma-9-baseos|https://repo.almalinux.org/almalinux/9/BaseOS/x86_64/os/|AlmaLinux 9|BaseOS,rocky-9-baseos|https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/|Rocky Linux 9|BaseOS,oracle-9-baseos|https://yum.oracle.com/repo/OracleLinux/OL9/baseos/latest/x86_64/|Oracle Linux 9|BaseOS,redhat-ubi9-baseos|https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/|Red Hat UBI 9|BaseOS
+alma-10-baseos|https://repo.almalinux.org/almalinux/10/BaseOS/x86_64/os/|AlmaLinux 10|BaseOS,alma-9-baseos|https://repo.almalinux.org/almalinux/9/BaseOS/x86_64/os/|AlmaLinux 9|BaseOS,alma-8-baseos|https://repo.almalinux.org/almalinux/8/BaseOS/x86_64/os/|AlmaLinux 8|BaseOS,rocky-10-baseos|https://dl.rockylinux.org/pub/rocky/10/BaseOS/x86_64/os/|Rocky Linux 10|BaseOS,rocky-9-baseos|https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/|Rocky Linux 9|BaseOS,rocky-8-baseos|https://dl.rockylinux.org/pub/rocky/8/BaseOS/x86_64/os/|Rocky Linux 8|BaseOS,oracle-10-baseos|https://yum.oracle.com/repo/OracleLinux/OL10/baseos/latest/x86_64/|Oracle Linux 10|BaseOS,oracle-9-baseos|https://yum.oracle.com/repo/OracleLinux/OL9/baseos/latest/x86_64/|Oracle Linux 9|BaseOS,oracle-8-baseos|https://yum.oracle.com/repo/OracleLinux/OL8/baseos/latest/x86_64/|Oracle Linux 8|BaseOS,oracle-7-latest|https://yum.oracle.com/repo/OracleLinux/OL7/latest/x86_64/|Oracle Linux 7|Latest,redhat-ubi10-baseos|https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi10/10/x86_64/baseos/os/|Red Hat UBI 10|BaseOS,redhat-ubi9-baseos|https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/|Red Hat UBI 9|BaseOS,redhat-ubi8-baseos|https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi8/8/x86_64/baseos/os/|Red Hat UBI 8|BaseOS
 ```
 
-The UI exposes a distribution-family summary and can filter packages by Debian, AlmaLinux, Rocky Linux, Oracle Linux, or Red Hat.
+The UI exposes a distribution-family summary, version lanes, and package filters by Debian, AlmaLinux, Rocky Linux, Oracle Linux, Red Hat, and OS version.
 
 ## Development
 
