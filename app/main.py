@@ -170,8 +170,25 @@ def init_db() -> None:
               refreshed_at TEXT NOT NULL,
               UNIQUE(repo_name, package, version, architecture)
             );
+            CREATE TABLE IF NOT EXISTS scan_runs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              started_at TEXT NOT NULL,
+              finished_at TEXT,
+              status TEXT NOT NULL,
+              trigger TEXT NOT NULL,
+              repos_total INTEGER NOT NULL DEFAULT 0,
+              repos_ok INTEGER NOT NULL DEFAULT 0,
+              repos_error INTEGER NOT NULL DEFAULT 0,
+              packages_total INTEGER NOT NULL DEFAULT 0,
+              passed INTEGER NOT NULL DEFAULT 0,
+              review INTEGER NOT NULL DEFAULT 0,
+              failed INTEGER NOT NULL DEFAULT 0,
+              highest_severity TEXT NOT NULL DEFAULT 'none',
+              notes TEXT
+            );
             CREATE INDEX IF NOT EXISTS idx_packages_name ON packages(package);
             CREATE INDEX IF NOT EXISTS idx_packages_status ON packages(security_status);
+            CREATE INDEX IF NOT EXISTS idx_scan_runs_started ON scan_runs(started_at);
             """
         )
         ensure_column(conn, "repos", "repo_type", "TEXT NOT NULL DEFAULT 'apt'")
@@ -316,7 +333,118 @@ def package_limit() -> int | None:
 
 
 def add_check(checks: list[dict[str, Any]], check_id: str, label: str, status: str, severity: str, detail: str) -> None:
-    checks.append({"id": check_id, "label": label, "status": status, "severity": severity, "detail": detail})
+    checks.append(
+        {
+            "id": check_id,
+            "label": label,
+            "status": status,
+            "severity": severity,
+            "detail": detail,
+            "remediation": remediation_for(check_id, status, severity, detail),
+        }
+    )
+
+
+def remediation_for(check_id: str, status: str, severity: str, detail: str) -> dict[str, Any]:
+    if status == "passed":
+        return {
+            "action": "No action required",
+            "priority": "none",
+            "owner": "repository operator",
+            "steps": ["Keep package under normal scheduled refresh monitoring."],
+        }
+    playbooks: dict[str, dict[str, Any]] = {
+        "checksum": {
+            "action": "Quarantine until checksum metadata is corrected",
+            "owner": "repository maintainer",
+            "steps": [
+                "Do not promote this package into trusted mirrors.",
+                "Re-fetch repository metadata from the upstream source.",
+                "Compare package checksum against signed Release or repomd metadata.",
+                "Escalate to the repository owner if the checksum remains missing or malformed.",
+            ],
+        },
+        "artifact_type": {
+            "action": "Block package because artifact extension does not match repository type",
+            "owner": "repository maintainer",
+            "steps": [
+                "Remove the package from the candidate mirror set.",
+                "Confirm whether the source is a DEB or RPM repository.",
+                "Correct the repository configuration before rescanning.",
+            ],
+        },
+        "declared_size": {
+            "action": "Verify artifact metadata before promotion",
+            "owner": "package reviewer",
+            "steps": [
+                "Fetch package headers from the upstream repository.",
+                "Confirm the artifact size is non-zero and matches repository metadata.",
+                "Rescan the repository after metadata refresh.",
+            ],
+        },
+        "transport": {
+            "action": "Move repository metadata fetches to HTTPS",
+            "owner": "platform operator",
+            "steps": [
+                "Update the repository base URL to an HTTPS endpoint.",
+                "Validate certificate trust from the cluster runtime.",
+                "Refresh the index and confirm the transport check passes.",
+            ],
+        },
+        "security_channel": {
+            "action": "Review security-channel package before fleet rollout",
+            "owner": "security reviewer",
+            "steps": [
+                "Read the upstream advisory or changelog for affected CVEs.",
+                "Prioritize vulnerable fleets that run this OS version.",
+                "Approve rollout only after compatibility checks pass.",
+            ],
+        },
+        "priority": {
+            "action": "Stage high-impact package updates",
+            "owner": "change manager",
+            "steps": [
+                "Test the package in a non-production fleet lane.",
+                "Schedule a maintenance window if the package is required or important.",
+                "Monitor dependent services after rollout.",
+            ],
+        },
+        "sensitive_section": {
+            "action": "Route sensitive package to manual review",
+            "owner": "security reviewer",
+            "steps": [
+                "Inspect package purpose, dependencies, and maintainer.",
+                "Check whether the package affects kernel, networking, auth, or system services.",
+                "Require approval before mirroring to production consumers.",
+            ],
+        },
+        "privileged_behavior": {
+            "action": "Require privileged-code approval",
+            "owner": "security reviewer",
+            "steps": [
+                "Review package scripts and declared capabilities.",
+                "Confirm whether setuid, kernel, or root-level behavior is expected.",
+                "Approve only after sandbox or staging validation.",
+            ],
+        },
+        "advisory_signal": {
+            "action": "Attach advisory context to rollout decision",
+            "owner": "security reviewer",
+            "steps": [
+                "Map advisory keywords to CVE, errata, or vendor bulletin records.",
+                "Record impacted OS versions and package versions.",
+                "Prefer patched package versions during remediation rollout.",
+            ],
+        },
+        "metadata": {
+            "action": "Continue normal monitoring",
+            "owner": "repository operator",
+            "steps": ["Keep package under scheduled scan cadence."],
+        },
+    }
+    playbook = playbooks.get(check_id, playbooks["metadata"])
+    priority = {"critical": "urgent", "high": "high", "medium": "normal", "low": "low"}.get(severity, "normal")
+    return {**playbook, "priority": priority, "evidence": detail}
 
 
 def validate_package(record: dict[str, Any], repo: Repo | None = None) -> dict[str, Any]:
@@ -377,14 +505,152 @@ def validate_package(record: dict[str, Any], repo: Repo | None = None) -> dict[s
     severity = max((check["severity"] for check in checks), key=lambda value: severity_rank.get(value, 0))
     status = max((check["status"] for check in checks), key=lambda value: status_rank.get(value, 0))
     findings = [check["detail"] for check in checks if check["status"] != "passed"]
+    remediation = [check["remediation"] for check in checks if check["status"] != "passed"]
     risk_score = sum({"none": 0, "low": 5, "medium": 15, "high": 30, "critical": 60}.get(check["severity"], 0) for check in checks)
     return {
         "status": status,
         "severity": severity,
         "risk_score": min(risk_score, 100),
         "findings": findings,
+        "remediation": remediation,
         "checks": checks,
     }
+
+
+def package_intelligence(package: dict[str, Any]) -> dict[str, Any]:
+    name = str(package.get("package") or package.get("Package") or "").lower()
+    section = str(package.get("section") or package.get("Section") or "").lower()
+    description = str(package.get("description") or package.get("Description") or "").strip()
+    maintainer = str(package.get("maintainer") or package.get("Maintainer") or "").strip()
+    checks = package.get("security_checks") or []
+    if isinstance(checks, str):
+        try:
+            checks = json.loads(checks)
+        except json.JSONDecodeError:
+            checks = []
+    findings = package.get("security_findings") or []
+    if isinstance(findings, str):
+        try:
+            findings = json.loads(findings)
+        except json.JSONDecodeError:
+            findings = []
+
+    category, responsibility = classify_package(name, section, description)
+    owner = maintainer or default_owner_for(category)
+    primary_purpose = first_sentence(description) or responsibility
+    status = package.get("security_status") or "passed"
+    failed_checks = [check for check in checks if check.get("status") == "failed"]
+    review_checks = [check for check in checks if check.get("status") == "review"]
+    unsafe_reasons = [check.get("detail", "") for check in [*failed_checks, *review_checks] if check.get("detail")]
+    why_not_safe = (
+        "No unsafe condition detected by current metadata checks."
+        if status == "passed"
+        else "; ".join(unsafe_reasons or findings or ["Package requires manual security review."])
+    )
+    impact = impact_for(category, status, package.get("security_severity", "none"))
+    safety_summary = (
+        "Safe for normal mirror eligibility under scheduled monitoring."
+        if status == "passed"
+        else f"{status.title()} because {why_not_safe}"
+    )
+    return {
+        "category": category,
+        "responsibility": responsibility,
+        "primary_purpose": primary_purpose,
+        "operational_owner": owner,
+        "impact": impact,
+        "safety_summary": safety_summary,
+        "why_not_safe": why_not_safe,
+        "unsafe_check_ids": [check.get("id") for check in [*failed_checks, *review_checks] if check.get("id")],
+    }
+
+
+def classify_package(name: str, section: str, description: str) -> tuple[str, str]:
+    text = f"{name} {section} {description}".lower()
+    rules = [
+        ("kernel", "Kernel and boot", "Manages kernel, boot, or low-level host runtime components."),
+        ("linux-image", "Kernel and boot", "Provides the Linux kernel image used to boot hosts."),
+        ("initramfs", "Kernel and boot", "Builds early boot images required before the root filesystem is mounted."),
+        ("systemd", "System services", "Controls service supervision, boot targets, and host lifecycle behavior."),
+        ("openssh", "Remote access", "Provides SSH client or server access for remote administration."),
+        ("ssh", "Remote access", "Provides SSH client or server access for remote administration."),
+        ("openssl", "Cryptography", "Provides TLS and cryptographic primitives used by applications and services."),
+        ("gnutls", "Cryptography", "Provides TLS and cryptographic primitives used by applications and services."),
+        ("crypto", "Cryptography", "Provides cryptographic libraries or security primitives."),
+        ("auth", "Identity and access", "Handles authentication, authorization, or identity integration."),
+        ("pam", "Identity and access", "Handles pluggable authentication for logins and privileged actions."),
+        ("sudo", "Privilege management", "Controls delegated administrative privilege on hosts."),
+        ("selinux", "Mandatory access control", "Enforces host security labels and mandatory access policy."),
+        ("firewall", "Network security", "Controls packet filtering or network access policy."),
+        ("iptables", "Network security", "Controls packet filtering or network access policy."),
+        ("nftables", "Network security", "Controls packet filtering or network access policy."),
+        ("network", "Networking", "Provides network configuration, client, daemon, or protocol support."),
+        ("dns", "Networking", "Provides name resolution, DNS server, or DNS client behavior."),
+        ("http", "Web and API services", "Provides web server, HTTP client, or API transport functionality."),
+        ("nginx", "Web and API services", "Provides web serving, reverse proxy, or HTTP routing capability."),
+        ("apache", "Web and API services", "Provides web serving, reverse proxy, or HTTP routing capability."),
+        ("postgres", "Database", "Provides database client, server, or database integration support."),
+        ("mysql", "Database", "Provides database client, server, or database integration support."),
+        ("mariadb", "Database", "Provides database client, server, or database integration support."),
+        ("sqlite", "Database", "Provides embedded database storage or database client libraries."),
+        ("python", "Language runtime", "Provides Python runtime, libraries, packaging, or build support."),
+        ("node", "Language runtime", "Provides JavaScript runtime, libraries, packaging, or build support."),
+        ("java", "Language runtime", "Provides JVM runtime, libraries, packaging, or build support."),
+        ("perl", "Language runtime", "Provides Perl runtime, libraries, packaging, or build support."),
+        ("ruby", "Language runtime", "Provides Ruby runtime, libraries, packaging, or build support."),
+        ("container", "Container runtime", "Provides container runtime, image, or orchestration support."),
+        ("docker", "Container runtime", "Provides container runtime, image, or orchestration support."),
+        ("podman", "Container runtime", "Provides container runtime, image, or orchestration support."),
+        ("rpm", "Package management", "Provides package installation, repository metadata, or package tooling."),
+        ("dnf", "Package management", "Provides package installation, repository metadata, or package tooling."),
+        ("apt", "Package management", "Provides package installation, repository metadata, or package tooling."),
+        ("devel", "Build tooling", "Provides headers, compilers, or libraries used to build software."),
+        ("compiler", "Build tooling", "Provides headers, compilers, or libraries used to build software."),
+        ("library", "Shared library", "Provides reusable runtime code consumed by other packages."),
+        ("libs", "Shared library", "Provides reusable runtime code consumed by other packages."),
+        ("doc", "Documentation", "Provides documentation, examples, or reference material."),
+        ("font", "Fonts and assets", "Provides fonts, icons, media, or other user-interface assets."),
+    ]
+    for needle, category, responsibility in rules:
+        if needle in text:
+            return category, responsibility
+    if "admin" in section or "system" in section:
+        return "System administration", "Provides host administration, maintenance, or system utility functionality."
+    if "net" in section:
+        return "Networking", "Provides network configuration, client, daemon, or protocol support."
+    if "lib" in name or section.startswith("lib"):
+        return "Shared library", "Provides reusable runtime code consumed by other packages."
+    return "Application or utility", "Provides an application, command-line tool, service, or supporting utility."
+
+
+def first_sentence(text: str) -> str:
+    normalized = " ".join(text.split())
+    if not normalized:
+        return ""
+    match = re.search(r"(.{20,220}?[.!?])(?:\s|$)", normalized)
+    return match.group(1) if match else normalized[:220]
+
+
+def default_owner_for(category: str) -> str:
+    if category in {"Kernel and boot", "System services", "Privilege management", "Mandatory access control"}:
+        return "platform operations"
+    if category in {"Cryptography", "Identity and access", "Network security", "Remote access"}:
+        return "security team"
+    if category in {"Database", "Web and API services", "Language runtime", "Shared library"}:
+        return "application owner"
+    return "repository operator"
+
+
+def impact_for(category: str, status: str, severity: str) -> str:
+    if status == "passed":
+        return f"{category} package is eligible for normal consumption monitoring."
+    if severity in {"critical", "high"}:
+        return f"{category} package can affect fleet stability or trust boundaries; prioritize review before promotion."
+    return f"{category} package needs validation before broad rollout."
+
+
+def enrich_package(row: dict[str, Any]) -> dict[str, Any]:
+    return {**row, **package_intelligence(row)}
 
 
 def assess_package(record: dict[str, Any]) -> tuple[str, list[str]]:
@@ -502,13 +768,83 @@ async def refresh_repo(repo: Repo) -> dict[str, Any]:
         return {"repo": repo.name, "status": "error", "error": str(exc)}
 
 
-async def refresh_all() -> list[dict[str, Any]]:
-    return [await refresh_repo(repo) for repo in configured_repos()]
+def security_totals(conn: sqlite3.Connection) -> dict[str, Any]:
+    return dict(
+        conn.execute(
+            """
+            SELECT
+              COUNT(*) total,
+              COALESCE(SUM(security_status='passed'), 0) passed,
+              COALESCE(SUM(security_status='review'), 0) review,
+              COALESCE(SUM(security_status='failed'), 0) failed,
+              COALESCE(SUM(security_severity='critical'), 0) critical,
+              COALESCE(SUM(security_severity='high'), 0) high,
+              COALESCE(SUM(security_severity='medium'), 0) medium,
+              COALESCE(ROUND(AVG(security_risk_score), 1), 0) avg_risk
+            FROM packages
+            """
+        ).fetchone()
+    )
+
+
+def highest_severity(totals: dict[str, Any]) -> str:
+    if totals.get("critical"):
+        return "critical"
+    if totals.get("high"):
+        return "high"
+    if totals.get("medium"):
+        return "medium"
+    return "none"
+
+
+async def refresh_all(trigger: str = "manual") -> list[dict[str, Any]]:
+    repos = configured_repos()
+    started_at = now_iso()
+    with closing(connect_db()) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO scan_runs(started_at, status, trigger, repos_total, notes)
+            VALUES (?, 'running', ?, ?, ?)
+            """,
+            (started_at, trigger, len(repos), "Repository metadata refresh and package security validation started."),
+        )
+        run_id = cursor.lastrowid
+        conn.commit()
+    results = [await refresh_repo(repo) for repo in repos]
+    with closing(connect_db()) as conn:
+        totals = security_totals(conn)
+        repos_ok = sum(1 for result in results if result.get("status") == "ok")
+        repos_error = len(results) - repos_ok
+        status = "failed" if repos_ok == 0 else "degraded" if repos_error else "succeeded"
+        conn.execute(
+            """
+            UPDATE scan_runs
+            SET finished_at = ?, status = ?, repos_ok = ?, repos_error = ?,
+                packages_total = ?, passed = ?, review = ?, failed = ?,
+                highest_severity = ?, notes = ?
+            WHERE id = ?
+            """,
+            (
+                now_iso(),
+                status,
+                repos_ok,
+                repos_error,
+                totals["total"],
+                totals["passed"],
+                totals["review"],
+                totals["failed"],
+                highest_severity(totals),
+                f"Validated {totals['total']} packages across {repos_ok}/{len(results)} healthy repositories.",
+                run_id,
+            ),
+        )
+        conn.commit()
+    return results
 
 
 def schedule_refresh() -> BackgroundScheduler:
     scheduler = BackgroundScheduler(timezone="UTC")
-    scheduler.add_job(lambda: __import__("asyncio").run(refresh_all()), "interval", minutes=REFRESH_INTERVAL_MINUTES)
+    scheduler.add_job(lambda: __import__("asyncio").run(refresh_all("scheduled")), "interval", minutes=REFRESH_INTERVAL_MINUTES)
     scheduler.start()
     return scheduler
 
@@ -540,7 +876,31 @@ def readyz() -> dict[str, Any]:
 
 @app.post("/api/refresh")
 async def api_refresh() -> JSONResponse:
-    return JSONResponse({"results": await refresh_all()})
+    return JSONResponse({"results": await refresh_all("manual-refresh")})
+
+
+@app.post("/api/scans")
+async def api_scan() -> JSONResponse:
+    return JSONResponse({"results": await refresh_all("manual-scan")})
+
+
+@app.get("/api/scans")
+def api_scans(limit: int = Query(10, ge=1, le=50)) -> dict[str, Any]:
+    with closing(connect_db()) as conn:
+        runs = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT *
+                FROM scan_runs
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+        ]
+        current = runs[0] if runs else None
+    return {"current": current, "runs": runs}
 
 
 @app.get("/api/repos")
@@ -596,22 +956,7 @@ def api_families() -> list[dict[str, Any]]:
 @app.get("/api/security")
 def api_security() -> dict[str, Any]:
     with closing(connect_db()) as conn:
-        totals = dict(
-            conn.execute(
-                """
-                SELECT
-                  COUNT(*) total,
-                  COALESCE(SUM(security_status='passed'), 0) passed,
-                  COALESCE(SUM(security_status='review'), 0) review,
-                  COALESCE(SUM(security_status='failed'), 0) failed,
-                  COALESCE(SUM(security_severity='critical'), 0) critical,
-                  COALESCE(SUM(security_severity='high'), 0) high,
-                  COALESCE(SUM(security_severity='medium'), 0) medium,
-                  COALESCE(ROUND(AVG(security_risk_score), 1), 0) avg_risk
-                FROM packages
-                """
-            ).fetchone()
-        )
+        totals = security_totals(conn)
         by_family = [
             dict(row)
             for row in conn.execute(
@@ -650,6 +995,7 @@ def api_security() -> dict[str, Any]:
         ]
     for row in top_risk:
         row["security_findings"] = json.loads(row["security_findings"])
+        row.update(package_intelligence(row))
     return {"totals": totals, "by_family": by_family, "top_risk": top_risk}
 
 
@@ -731,6 +1077,7 @@ def api_packages(
         for row in rows:
             row["security_findings"] = json.loads(row["security_findings"])
             row["security_checks"] = json.loads(row["security_checks"])
+            row.update(package_intelligence(row))
         totals = dict(
             conn.execute(
                 """
@@ -744,6 +1091,41 @@ def api_packages(
             ).fetchone()
         )
     return {"packages": rows, "totals": totals}
+
+
+@app.get("/api/packages/{package_id}")
+def api_package(package_id: int) -> dict[str, Any]:
+    with closing(connect_db()) as conn:
+        row = conn.execute(
+            """
+            SELECT packages.*, repos.distro_family, repos.release_version, repos.base_url
+            FROM packages
+            JOIN repos ON repos.name = packages.repo_name
+            WHERE packages.id = ?
+            """,
+            (package_id,),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="package not found")
+    item = dict(row)
+    item["security_findings"] = json.loads(item["security_findings"])
+    item["security_checks"] = json.loads(item["security_checks"])
+    item.update(package_intelligence(item))
+    item["remediation"] = [
+        check.get("remediation", remediation_for(check.get("id", "metadata"), check.get("status", "review"), check.get("severity", "medium"), check.get("detail", "")))
+        for check in item["security_checks"]
+        if check.get("status") != "passed"
+    ]
+    item["recommended_action"] = remediation_summary(item)
+    return item
+
+
+def remediation_summary(package: dict[str, Any]) -> str:
+    if package.get("security_status") == "passed":
+        return "No remediation required. Keep this package under scheduled monitoring."
+    if package.get("security_status") == "failed":
+        return "Block promotion, quarantine the package from trusted mirrors, and resolve failed metadata checks before rollout."
+    return "Route to manual security review, attach advisory context, and approve only after OS-version compatibility checks pass."
 
 
 def dashboard_html() -> str:
@@ -824,6 +1206,23 @@ def dashboard_html() -> str:
     .risk-item { display:grid; grid-template-columns:1fr auto; gap:10px; align-items:center; padding:10px 0; border-top:1px solid rgba(16,20,24,.08); }
     .risk-item strong { font-size:13px; overflow-wrap:anywhere; }
     .risk-item span { color:var(--muted); font-size:12px; text-align:right; }
+    .scan-console { display:grid; grid-template-columns:minmax(280px,.9fr) minmax(360px,1.1fr); gap:14px; margin:0 0 34px; }
+    .scan-card, .remediation-card { border-radius:22px; padding:18px; background:rgba(255,255,255,.84); border:1px solid rgba(16,20,24,.08); box-shadow:inset 0 1px 0 rgba(255,255,255,.9); }
+    .scan-card h3, .remediation-card h3 { margin:8px 0 12px; font-size:clamp(24px,3vw,38px); line-height:1; }
+    .scan-actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:16px; }
+    .scan-history { display:grid; gap:8px; margin-top:14px; }
+    .scan-run { display:grid; grid-template-columns:auto 1fr auto; gap:10px; align-items:center; padding:10px 0; border-top:1px solid rgba(16,20,24,.08); }
+    .scan-run code { font-family:"SFMono-Regular", Consolas, ui-monospace, monospace; font-size:12px; color:#34424e; }
+    .remediation-list { display:grid; gap:10px; margin-top:14px; }
+    .remediation-item { padding:12px; border-radius:16px; background:rgba(16,20,24,.045); border:1px solid rgba(16,20,24,.07); }
+    .remediation-item strong { display:block; margin-bottom:6px; }
+    .remediation-item ol { margin:8px 0 0 18px; padding:0; color:#40505c; font-size:13px; line-height:1.5; }
+    .package-brief { display:grid; gap:10px; margin-top:14px; }
+    .brief-row { padding:12px; border-radius:16px; background:rgba(10,111,100,.055); border:1px solid rgba(10,111,100,.1); }
+    .brief-row span { display:block; margin-bottom:5px; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.12em; }
+    .brief-row strong { display:block; line-height:1.35; }
+    .details-button { all:unset; cursor:pointer; color:var(--accent); font-weight:760; }
+    .details-button:focus-visible { outline:3px solid rgba(10,111,100,.22); outline-offset:3px; border-radius:8px; }
     .badge { display:inline-flex; align-items:center; border-radius:999px; padding:5px 10px; font-size:12px; font-weight:720; text-transform:uppercase; letter-spacing:.08em; }
     .passed { color:#063f27; background:rgba(8,116,67,.13); }
     .review { color:#62440a; background:rgba(138,100,26,.16); }
@@ -836,13 +1235,15 @@ def dashboard_html() -> str:
     .error { color: var(--bad); }
     .table-shell { border-radius:28px; padding:8px; background:rgba(16,20,24,.06); box-shadow:var(--shadow); }
     .table-wrap { border-radius:22px; overflow:auto; background:rgba(255,255,255,.9); max-height:720px; box-shadow:inset 0 1px 0 rgba(255,255,255,.86); }
-    table { width:100%; border-collapse:collapse; table-layout:fixed; min-width:980px; }
+    table { width:100%; border-collapse:collapse; table-layout:fixed; min-width:1240px; }
     th, td { border-bottom:1px solid rgba(16,20,24,.08); padding:15px 14px; text-align:left; vertical-align:top; font-size:13px; }
     th { position:sticky; top:0; z-index:1; color:#34424e; background:rgba(255,255,255,.96); font-size:11px; text-transform:uppercase; letter-spacing:.13em; }
-    td:nth-child(1) { width:16%; font-weight:750; }
-    td:nth-child(2) { width:20%; overflow-wrap:anywhere; font-variant-numeric:tabular-nums; }
-    td:nth-child(3), td:nth-child(4) { width:9%; }
-    td:nth-child(5), td:nth-child(6) { width:10%; }
+    td:nth-child(1) { width:14%; font-weight:750; }
+    td:nth-child(2) { width:17%; overflow-wrap:anywhere; font-variant-numeric:tabular-nums; }
+    td:nth-child(3) { width:11%; }
+    td:nth-child(4) { width:14%; }
+    td:nth-child(5), td:nth-child(6), td:nth-child(7), td:nth-child(8) { width:8%; }
+    td:nth-child(9), td:nth-child(10) { width:15%; }
     tbody tr { transition:background .45s var(--ease); }
     tbody tr:hover { background:rgba(10,111,100,.055); }
     .skeleton { position:relative; overflow:hidden; border-radius:14px; background:rgba(16,20,24,.08); min-height:18px; }
@@ -862,6 +1263,7 @@ def dashboard_html() -> str:
       .hero-core { min-height:260px; }
       .metrics { grid-template-columns:repeat(2,minmax(120px,1fr)); }
       .security-grid { grid-template-columns:1fr; }
+      .scan-console { grid-template-columns:1fr; }
       .toolbar { grid-template-columns:1fr; }
       .section-head { align-items:flex-start; flex-direction:column; }
     }
@@ -881,6 +1283,7 @@ def dashboard_html() -> str:
         <p class="lede">Track Debian APT plus AlmaLinux, Rocky Linux, Oracle Linux, and Red Hat RPM repositories with security review signals from one production console.</p>
         <div class="hero-actions">
           <button id="refresh">Refresh index <span class="button-orb" aria-hidden="true">+</span></button>
+          <button id="scan">Run scan <span class="button-orb" aria-hidden="true">!</span></button>
           <button class="ghost" id="show-review">Review queue <span class="button-orb" aria-hidden="true">&gt;</span></button>
         </div>
       </section>
@@ -900,9 +1303,20 @@ def dashboard_html() -> str:
           <div class="eyebrow">Security validation</div>
           <h2>All package checks</h2>
         </div>
-        <p class="muted">Every indexed DEB and RPM record is scored for metadata integrity, trusted transport, update-channel context, and sensitive package behavior.</p>
+        <p class="muted">Every indexed DEB and RPM record is scored for metadata integrity, trusted transport, update-channel context, sensitive behavior, package purpose, and operational impact.</p>
       </div>
       <section class="security-grid" id="security" aria-label="Package validation summary"></section>
+      <div class="section-head">
+        <div>
+          <div class="eyebrow">Scan operations</div>
+          <h2>Scan runs and remediation</h2>
+        </div>
+        <p class="muted">Launch package validation, inspect current run evidence, and turn findings into operator action.</p>
+      </div>
+      <section class="scan-console" aria-label="Security scan operations">
+        <article class="scan-card" id="scan-runs"></article>
+        <article class="remediation-card" id="remediation"></article>
+      </section>
       <div class="section-head">
         <div>
           <div class="eyebrow">RHEL-family coverage</div>
@@ -922,7 +1336,7 @@ def dashboard_html() -> str:
       <div class="section-head">
         <div>
           <div class="eyebrow">Package inventory</div>
-          <h2>Security review table</h2>
+          <h2>Package intelligence table</h2>
         </div>
       </div>
       <div class="toolbar" role="search">
@@ -943,7 +1357,7 @@ def dashboard_html() -> str:
       <section class="table-shell" id="packages-table">
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Package</th><th>Version</th><th>Repo</th><th>Format</th><th>Status</th><th>Severity</th><th>Risk</th><th>Findings</th><th>Description</th></tr></thead>
+            <thead><tr><th>Package</th><th>Version</th><th>Repo</th><th>Responsible for</th><th>Format</th><th>Status</th><th>Severity</th><th>Risk</th><th>Why unsafe</th><th>Purpose</th></tr></thead>
             <tbody id="packages"></tbody>
           </table>
         </div>
@@ -957,14 +1371,14 @@ def dashboard_html() -> str:
   <script>
     const $ = (id) => document.getElementById(id);
     const esc = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-    const skeletonRows = () => Array.from({length: 8}).map(() => '<tr><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td></tr>').join('');
+    const skeletonRows = () => Array.from({length: 8}).map(() => '<tr><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td></tr>').join('');
     const statusClass = (value) => ['passed', 'review', 'failed', 'pending'].includes(value) ? value : 'pending';
     const n = (value) => Number(value || 0).toLocaleString();
     async function load() {
       $('packages').innerHTML = skeletonRows();
       try {
         const params = new URLSearchParams({ q: $('q').value, status: $('status').value, family: $('family').value, version: $('version').value, limit: '300' });
-        const [repos, families, versions, security, packages] = await Promise.all([fetch('/api/repos').then(r => r.json()), fetch('/api/families').then(r => r.json()), fetch('/api/versions').then(r => r.json()), fetch('/api/security').then(r => r.json()), fetch('/api/packages?' + params).then(r => r.json())]);
+        const [repos, families, versions, security, scans, packages] = await Promise.all([fetch('/api/repos').then(r => r.json()), fetch('/api/families').then(r => r.json()), fetch('/api/versions').then(r => r.json()), fetch('/api/security').then(r => r.json()), fetch('/api/scans').then(r => r.json()), fetch('/api/packages?' + params).then(r => r.json())]);
         const totals = packages.totals || {};
         $('hero-summary').innerHTML = [
           ['Indexed packages', n(totals.total)],
@@ -978,6 +1392,13 @@ def dashboard_html() -> str:
         const lanes = (security.by_family || []).slice(0, 10).map(row => `<div class="risk-item"><strong>${esc(row.distro_family)} v${esc(row.release_version || 'n/a')}</strong><span>${n(row.review)} review / ${n(row.failed)} failed</span></div>`).join('');
         const topRisk = (security.top_risk || []).slice(0, 8).map(row => `<div class="risk-item"><strong>${esc(row.package)}</strong><span>${esc(row.security_severity)} - ${n(row.security_risk_score)}</span></div>`).join('');
         $('security').innerHTML = `<article class="security-panel"><div class="eyebrow">Average risk</div><h3>${avgRisk.toFixed(1)} / 100</h3><div class="risk-meter"><span style="width:${avgRisk}%"></span></div><p class="muted">${n(securityTotals.total)} packages scanned, ${n(securityTotals.critical)} critical metadata failures, ${n(securityTotals.high)} high review signals.</p><div class="risk-list">${lanes || '<div class="risk-item"><strong>No scan data</strong><span>refresh index</span></div>'}</div></article><article class="security-panel"><div class="eyebrow">Highest risk packages</div><h3>Validation queue</h3><div class="risk-list">${topRisk || '<div class="risk-item"><strong>No packages need review</strong><span>clear</span></div>'}</div></article>`;
+        const currentRun = scans.current || {};
+        const history = (scans.runs || []).map(run => `<div class="scan-run"><span class="badge ${run.status === 'succeeded' ? 'passed' : run.status === 'running' ? 'pending' : run.status === 'degraded' ? 'review' : 'failed'}">${esc(run.status)}</span><div><code>#${esc(run.id)} ${esc(run.trigger)}</code><br><span class="muted">${esc(run.started_at)}${run.finished_at ? ' to ' + esc(run.finished_at) : ''}</span></div><span>${n(run.packages_total)} pkgs</span></div>`).join('');
+        $('scan-runs').innerHTML = `<div class="eyebrow">Current scan</div><h3>${currentRun.id ? '#' + esc(currentRun.id) : 'No scan yet'}</h3><p class="muted">${esc(currentRun.notes || 'Run a scan to validate package metadata and generate remediation guidance.')}</p><div class="scan-actions"><button id="run-scan-inline">Run scan <span class="button-orb" aria-hidden="true">!</span></button><button class="ghost" id="failed-inline">Failed only <span class="button-orb" aria-hidden="true">&gt;</span></button></div><div class="scan-history">${history || '<div class="scan-run"><span class="badge pending">pending</span><div><code>No runs recorded</code><br><span class="muted">Start with Run scan</span></div><span>0 pkgs</span></div>'}</div>`;
+        const remediationRows = (security.top_risk || []).slice(0, 4).map(row => `<div class="remediation-item"><strong>${esc(row.package)} <span class="badge ${esc(row.security_severity)}">${esc(row.security_severity)}</span></strong><span class="muted">${esc(row.responsibility || row.category || 'Package intelligence')}</span><br><span class="muted">${esc(row.why_not_safe || (row.security_findings || []).join('; ') || 'manual review')}</span></div>`).join('');
+        $('remediation').innerHTML = `<div class="eyebrow">Remediation queue</div><h3>${n(securityTotals.review + securityTotals.failed)} actions</h3><p class="muted">Open a package row to see the exact owner, priority, evidence, and fix steps for each failed or review check.</p><div class="remediation-list">${remediationRows || '<div class="remediation-item"><strong>No active remediation</strong><span class="muted">All current package checks passed.</span></div>'}</div>`;
+        $('run-scan-inline').addEventListener('click', runScan);
+        $('failed-inline').addEventListener('click', () => { $('status').value = 'failed'; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
         const familyValue = $('family').value;
         $('family').innerHTML = '<option value="">All families</option>' + families.map(f => `<option value="${esc(f.distro_family)}">${esc(f.distro_family)}</option>`).join('');
         $('family').value = familyValue;
@@ -991,12 +1412,28 @@ def dashboard_html() -> str:
           return `<article class="family" data-family="${esc(f.distro_family)}"><h3><span class="family-dot"></span>${esc(f.distro_family)}</h3><dl><div><dt>Repos</dt><dd>${n(f.repos)}</dd></div><div><dt>Versions</dt><dd>${n(f.version_count)}</dd></div><div><dt>Healthy</dt><dd>${n(f.healthy)}</dd></div><div><dt>Errors</dt><dd>${n(f.errors)}</dd></div></dl><div class="version-strip">${pills || '<span class="version-pill">No versions</span>'}</div></article>`;
         }).join('') : '<article class="family"><h3><span class="family-dot"></span>No family data</h3></article>';
         $('repos').innerHTML = repos.length ? repos.map((r, i) => `<article class="repo" style="animation-delay:${i * 70}ms"><div class="repo-core"><h3>${esc(r.name)} <span class="badge ${r.status === 'ok' ? 'passed' : 'failed'}">${esc(r.status)}</span></h3><p><span class="badge pending">${esc(r.distro_family || (r.repo_type || 'apt').toUpperCase())}</span> <span class="badge pending">v${esc(r.release_version || 'n/a')}</span> <span class="badge pending">${esc((r.repo_type || 'apt').toUpperCase())}</span></p><p>${esc(r.base_url)}</p><p>${esc(r.suite)}/${esc(r.component)} - ${n(r.package_count)} packages</p><p>Refreshed ${esc(r.last_refresh || 'never')}</p>${r.error ? `<p class="error">${esc(r.error)}</p>` : ''}</div></article>`).join('') : '<article class="repo"><div class="repo-core"><h3>No repositories configured</h3><p>Add APT_REPOS or RPM_REPOS entries to begin indexing.</p></div></article>';
-        $('packages').innerHTML = packages.packages.length ? packages.packages.map(p => `<tr><td>${esc(p.package)}</td><td>${esc(p.version)}</td><td>${esc(p.repo_name)}<br><span class="muted">${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</span></td><td>${esc((p.package_format || 'deb').toUpperCase())}</td><td><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span></td><td><span class="badge ${esc(p.security_severity || 'none')}">${esc(p.security_severity || 'none')}</span></td><td>${n(p.security_risk_score)}</td><td>${esc((p.security_findings || []).join('; ') || 'none')}</td><td class="muted">${esc((p.description || '').split('\\n')[0])}</td></tr>`).join('') : '<tr><td colspan="5"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></td><td colspan="4"></td></tr>';
+        $('packages').innerHTML = packages.packages.length ? packages.packages.map(p => `<tr><td><button class="details-button" data-package-id="${esc(p.id)}">${esc(p.package)}</button></td><td>${esc(p.version)}</td><td>${esc(p.repo_name)}<br><span class="muted">${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</span></td><td>${esc(p.category)}<br><span class="muted">${esc(p.responsibility)}</span></td><td>${esc((p.package_format || 'deb').toUpperCase())}</td><td><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span></td><td><span class="badge ${esc(p.security_severity || 'none')}">${esc(p.security_severity || 'none')}</span></td><td>${n(p.security_risk_score)}</td><td>${esc(p.why_not_safe || 'none')}</td><td class="muted">${esc(p.primary_purpose || (p.description || '').split('\\n')[0])}</td></tr>`).join('') : '<tr><td colspan="6"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></td><td colspan="4"></td></tr>';
+        document.querySelectorAll('.details-button').forEach(button => button.addEventListener('click', () => showPackage(button.dataset.packageId)));
       } catch (error) {
         $('packages').innerHTML = `<tr><td colspan="9"><div class="state error"><strong>Could not load package data</strong>${esc(error.message || error)}</div></td></tr>`;
       }
     }
+    async function runScan() {
+      $('scan').disabled = true;
+      $('scan').innerHTML = 'Scanning <span class="button-orb" aria-hidden="true">...</span>';
+      await fetch('/api/scans', { method: 'POST' });
+      $('scan').disabled = false;
+      $('scan').innerHTML = 'Run scan <span class="button-orb" aria-hidden="true">!</span>';
+      load();
+    }
+    async function showPackage(packageId) {
+      const p = await fetch('/api/packages/' + encodeURIComponent(packageId)).then(r => r.json());
+      const steps = (p.remediation || []).map(item => `<div class="remediation-item"><strong>${esc(item.action)} <span class="badge ${esc(item.priority === 'urgent' ? 'critical' : item.priority === 'high' ? 'high' : 'medium')}">${esc(item.priority)}</span></strong><span class="muted">${esc(item.owner)} - ${esc(item.evidence || '')}</span><ol>${(item.steps || []).map(step => `<li>${esc(step)}</li>`).join('')}</ol></div>`).join('');
+      $('remediation').innerHTML = `<div class="eyebrow">Package intelligence</div><h3>${esc(p.package)}</h3><div class="package-brief"><div class="brief-row"><span>Responsible for</span><strong>${esc(p.responsibility)}</strong></div><div class="brief-row"><span>Package purpose</span><strong>${esc(p.primary_purpose)}</strong></div><div class="brief-row"><span>Why it is not safe</span><strong>${esc(p.why_not_safe)}</strong></div><div class="brief-row"><span>Operational owner</span><strong>${esc(p.operational_owner)}</strong></div><div class="brief-row"><span>Impact</span><strong>${esc(p.impact)}</strong></div></div><p class="muted">${esc(p.recommended_action)}</p><div class="remediation-list">${steps || '<div class="remediation-item"><strong>No remediation required</strong><span class="muted">This package currently passes validation.</span></div>'}</div>`;
+      document.querySelector('.scan-console').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
     $('refresh').addEventListener('click', async () => { $('refresh').disabled = true; $('refresh').innerHTML = 'Refreshing <span class="button-orb" aria-hidden="true">...</span>'; await fetch('/api/refresh', { method: 'POST' }); $('refresh').disabled = false; $('refresh').innerHTML = 'Refresh index <span class="button-orb" aria-hidden="true">+</span>'; load(); });
+    $('scan').addEventListener('click', runScan);
     $('show-review').addEventListener('click', () => { $('status').value = 'review'; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
     $('q').addEventListener('input', () => clearTimeout(window.__t) || (window.__t = setTimeout(load, 250)));
     $('status').addEventListener('change', load);

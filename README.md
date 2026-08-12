@@ -1,6 +1,6 @@
 # pkgmng
 
-`pkgmng` is a Linux repository manager for APT and RHEL-family RPM sources. It indexes configured repositories, refreshes package metadata on a schedule, runs security validation on every indexed package record, and exposes a web UI plus JSON APIs.
+`pkgmng` is a Linux repository manager for APT and RHEL-family RPM sources. It indexes configured repositories, refreshes package metadata on a schedule, runs security validation on every indexed package record, and exposes scan results, package-level remediation guidance, a web UI, and JSON APIs.
 
 ## Runtime
 
@@ -55,6 +55,23 @@ Every indexed DEB and RPM package receives a structured validation profile:
 - `security_checks`: individual checks for checksum integrity, artifact type, declared size, repository transport, security update channel, sensitive sections, high-impact priorities, privileged behavior, and advisory keyword signals
 
 The `/api/security` endpoint returns global totals, OS/version breakdowns, and the highest-risk package records. The dashboard renders the same data in the "All package checks" panel and the package inventory table.
+
+## Scan and remediation workflow
+
+- `POST /api/scans` launches a repository refresh plus full package validation run.
+- `GET /api/scans` returns recent scan runs with status, trigger, repository health, total packages, pass/review/fail counts, and highest severity.
+- `GET /api/packages/{id}` returns the package validation profile with remediation guidance.
+- The UI includes a scan operations panel, scan history, a remediation queue, and package-row detail actions.
+
+Remediation is generated from the failing or review checks. Each remediation item includes:
+
+- action
+- priority
+- owner
+- evidence
+- ordered steps
+
+Failed packages are intended to be blocked or quarantined until metadata issues are resolved. Review packages are routed to manual security review before promotion into trusted mirrors.
 
 ## Development
 
