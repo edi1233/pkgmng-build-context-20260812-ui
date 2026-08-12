@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import gzip
+import io
 import json
 import lzma
 import os
 import re
 import sqlite3
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager, closing
@@ -190,14 +192,20 @@ def parse_packages_index(text: str) -> list[dict[str, Any]]:
     return records
 
 
-def parse_rpm_primary_xml(text: str) -> list[dict[str, Any]]:
+def parse_rpm_primary_xml(text: str, limit: int | None = None) -> list[dict[str, Any]]:
+    return parse_rpm_primary_stream(io.StringIO(text), limit)
+
+
+def parse_rpm_primary_stream(stream: Any, limit: int | None = None) -> list[dict[str, Any]]:
     ns = {
         "m": "http://linux.duke.edu/metadata/common",
         "rpm": "http://linux.duke.edu/metadata/rpm",
     }
-    root = ET.fromstring(text)
     records: list[dict[str, Any]] = []
-    for package in root.findall("m:package", ns):
+    package_tag = f"{{{ns['m']}}}package"
+    for _, package in ET.iterparse(stream, events=("end",)):
+        if package.tag != package_tag:
+            continue
         version = package.find("m:version", ns)
         checksum = package.find("m:checksum", ns)
         location = package.find("m:location", ns)
@@ -220,6 +228,9 @@ def parse_rpm_primary_xml(text: str) -> list[dict[str, Any]]:
                 "PackageFormat": "rpm",
             }
         )
+        package.clear()
+        if limit is not None and len(records) >= limit:
+            break
     return records
 
 
@@ -297,21 +308,26 @@ async def fetch_rpm_records(repo: Repo) -> list[dict[str, Any]]:
         repomd_response = await client.get(repo.repomd_url)
         repomd_response.raise_for_status()
         primary_url = f"{repo.base_url.rstrip('/')}/{rpm_primary_href(repomd_response.text).lstrip('/')}"
-        primary_response = await client.get(primary_url)
-        primary_response.raise_for_status()
-        data = primary_response.content
-        if primary_url.endswith(".gz"):
-            text = gzip.decompress(data).decode("utf-8", errors="replace")
-        elif primary_url.endswith(".xz"):
-            text = lzma.decompress(data).decode("utf-8", errors="replace")
-        else:
-            text = data.decode("utf-8", errors="replace")
-        return parse_rpm_primary_xml(text)
+        with tempfile.NamedTemporaryFile(dir=DATA_DIR, suffix=Path(primary_url).name) as spool:
+            async with client.stream("GET", primary_url) as primary_response:
+                primary_response.raise_for_status()
+                async for chunk in primary_response.aiter_bytes():
+                    spool.write(chunk)
+            spool.flush()
+            spool.seek(0)
+            if primary_url.endswith(".gz"):
+                with gzip.open(spool.name, "rt", encoding="utf-8", errors="replace") as stream:
+                    return parse_rpm_primary_stream(stream, MAX_PACKAGES_PER_REPO)
+            if primary_url.endswith(".xz"):
+                with lzma.open(spool.name, "rt", encoding="utf-8", errors="replace") as stream:
+                    return parse_rpm_primary_stream(stream, MAX_PACKAGES_PER_REPO)
+            with open(spool.name, encoding="utf-8", errors="replace") as stream:
+                return parse_rpm_primary_stream(stream, MAX_PACKAGES_PER_REPO)
 
 
 async def repo_records(repo: Repo) -> list[dict[str, Any]]:
     if repo.repo_type == "rpm":
-        return (await fetch_rpm_records(repo))[:MAX_PACKAGES_PER_REPO]
+        return await fetch_rpm_records(repo)
     text = await fetch_packages_text(repo)
     return [{**record, "PackageFormat": "deb"} for record in parse_packages_index(text)[:MAX_PACKAGES_PER_REPO]]
 
