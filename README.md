@@ -54,6 +54,10 @@ Every indexed DEB and RPM package receives a structured validation profile:
 - `security_findings`: concise operator-facing findings
 - `security_checks`: individual checks for checksum integrity, artifact type, declared size, repository transport, security update channel, sensitive sections, high-impact priorities, privileged behavior, and advisory keyword signals
 
+Checksum validation detects the algorithm published by repository metadata where available and falls back to digest length (`40=SHA-1`, `64=SHA-256`, `128=SHA-512`). Legacy RPM repositories that publish SHA-1 metadata are treated as valid metadata instead of critical checksum failures; malformed or unknown digest formats still fail.
+
+Sensitive package review is intentionally weighted toward high-impact areas such as kernel, authentication, privilege management, cryptography, firewall, and remote access. Generic `admin`, `system`, `utils`, or `net` package sections are not failed on section text alone.
+
 The `/api/security` endpoint returns global totals, OS/version breakdowns, and the highest-risk package records. The dashboard renders the same data in the "All package checks" panel and the package inventory table.
 
 ## Scan and remediation workflow
@@ -62,6 +66,11 @@ The `/api/security` endpoint returns global totals, OS/version breakdowns, and t
 - `GET /api/scans` returns recent scan runs with status, trigger, repository health, total packages, pass/review/fail counts, and highest severity.
 - `GET /api/packages/{id}` returns the package validation profile with remediation guidance.
 - The UI includes a scan operations panel, scan history, a remediation queue, and package-row detail actions.
+- `GET /api/packages` supports `limit` and `offset` pagination and returns `page.total`, `page.returned`, `page.offset`, and `page.has_more`.
+- Package rows expose architecture and checksum algorithm so source/binary variants do not look like duplicates.
+- Package detail distinguishes the internal owner lane from the upstream maintainer recorded in package metadata.
+
+State-changing endpoints (`POST /api/refresh`, `POST /api/scans`) support `Authorization: Bearer <ADMIN_TOKEN>` or `X-Pkgmng-Token` when `ADMIN_TOKEN` is configured, and apply a per-client rate limit controlled by `ACTION_RATE_LIMIT_SECONDS`.
 
 Remediation is generated from the failing or review checks. Each remediation item includes:
 

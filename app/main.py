@@ -18,7 +18,7 @@ from typing import Any
 
 import httpx
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 
@@ -53,6 +53,9 @@ RPM_REPOS = os.getenv(
 )
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))
 MAX_PACKAGES_PER_REPO = int(os.getenv("MAX_PACKAGES_PER_REPO", "0"))
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+ACTION_RATE_LIMIT_SECONDS = int(os.getenv("ACTION_RATE_LIMIT_SECONDS", "300"))
+ACTION_LAST_RUN: dict[str, float] = {}
 
 
 @dataclass(frozen=True)
@@ -159,6 +162,7 @@ def init_db() -> None:
               filename TEXT,
               size INTEGER,
               sha256 TEXT,
+              checksum_algorithm TEXT,
               maintainer TEXT,
               description TEXT,
               package_format TEXT NOT NULL DEFAULT 'deb',
@@ -195,6 +199,7 @@ def init_db() -> None:
         ensure_column(conn, "repos", "distro_family", "TEXT NOT NULL DEFAULT 'Debian'")
         ensure_column(conn, "repos", "release_version", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "packages", "package_format", "TEXT NOT NULL DEFAULT 'deb'")
+        ensure_column(conn, "packages", "checksum_algorithm", "TEXT")
         ensure_column(conn, "packages", "security_severity", "TEXT NOT NULL DEFAULT 'none'")
         ensure_column(conn, "packages", "security_risk_score", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "packages", "security_checks", "TEXT NOT NULL DEFAULT '[]'")
@@ -290,6 +295,7 @@ def parse_rpm_primary_stream(stream: Any, limit: int | None = None) -> list[dict
                 "Filename": location.attrib.get("href", "") if location is not None else "",
                 "Size": size.attrib.get("package", "0") if size is not None else "0",
                 "SHA256": checksum.text.strip() if checksum is not None and checksum.text else "",
+                "ChecksumType": checksum.attrib.get("type", "") if checksum is not None else "",
                 "Maintainer": text_of(package, "m:packager", ns),
                 "Description": text_of(package, "m:description", ns) or text_of(package, "m:summary", ns),
                 "PackageFormat": "rpm",
@@ -343,6 +349,25 @@ def add_check(checks: list[dict[str, Any]], check_id: str, label: str, status: s
             "remediation": remediation_for(check_id, status, severity, detail),
         }
     )
+
+
+KNOWN_DIGEST_LENGTHS = {
+    32: "md5",
+    40: "sha1",
+    64: "sha256",
+    96: "sha384",
+    128: "sha512",
+}
+
+
+def detect_checksum_algorithm(digest: str, declared: str = "") -> str:
+    normalized = (digest or "").strip()
+    declared = (declared or "").strip().lower().replace("-", "")
+    if declared in {"md5", "sha1", "sha224", "sha256", "sha384", "sha512"} and re.fullmatch(r"[A-Fa-f0-9]+", normalized):
+        return declared
+    if re.fullmatch(r"[A-Fa-f0-9]+", normalized):
+        return KNOWN_DIGEST_LENGTHS.get(len(normalized), "")
+    return ""
 
 
 def remediation_for(check_id: str, status: str, severity: str, detail: str) -> dict[str, Any]:
@@ -410,11 +435,11 @@ def remediation_for(check_id: str, status: str, severity: str, detail: str) -> d
             ],
         },
         "sensitive_section": {
-            "action": "Route sensitive package to manual review",
+            "action": "Route high-impact package area to manual review",
             "owner": "security reviewer",
             "steps": [
-                "Inspect package purpose, dependencies, and maintainer.",
-                "Check whether the package affects kernel, networking, auth, or system services.",
+                "Inspect package purpose, dependencies, scripts, and maintainer metadata.",
+                "Confirm whether the package affects kernel, auth, cryptography, firewall, or remote access paths.",
                 "Require approval before mirroring to production consumers.",
             ],
         },
@@ -451,16 +476,25 @@ def validate_package(record: dict[str, Any], repo: Repo | None = None) -> dict[s
     checks: list[dict[str, Any]] = []
     package_format = record.get("PackageFormat", "deb")
     filename = record.get("Filename", "")
-    sha256 = record.get("SHA256", "")
+    checksum = str(record.get("SHA256", "") or "")
+    declared_algorithm = str(record.get("ChecksumType", "") or record.get("checksum_algorithm", "") or "")
     size = int(record.get("Size", "0") or "0")
     expected_suffix = ".rpm" if package_format == "rpm" else ".deb"
 
-    if sha256 and re.fullmatch(r"[A-Fa-f0-9]{64}", sha256):
-        add_check(checks, "checksum", "SHA256 checksum", "passed", "none", "valid 64-character checksum")
-    elif sha256:
-        add_check(checks, "checksum", "SHA256 checksum", "failed", "critical", "checksum is present but not a valid SHA256 hex digest")
+    checksum_algorithm = detect_checksum_algorithm(checksum, declared_algorithm)
+    if checksum_algorithm:
+        add_check(
+            checks,
+            "checksum",
+            "Package checksum",
+            "passed",
+            "none",
+            f"valid {checksum_algorithm.upper()} checksum from repository metadata",
+        )
+    elif checksum:
+        add_check(checks, "checksum", "Package checksum", "failed", "critical", "checksum is present but does not match a known digest format")
     else:
-        add_check(checks, "checksum", "SHA256 checksum", "failed", "critical", "missing SHA256 checksum")
+        add_check(checks, "checksum", "Package checksum", "failed", "critical", "missing package checksum")
 
     if filename.endswith(expected_suffix):
         add_check(checks, "artifact_type", "Package artifact type", "passed", "none", f"filename ends with {expected_suffix}")
@@ -488,11 +522,27 @@ def validate_package(record: dict[str, Any], repo: Repo | None = None) -> dict[s
     priority = record.get("Priority", "").lower()
     if priority in {"required", "important"}:
         add_check(checks, "priority", "High-impact priority", "review", "high", f"high-impact priority: {priority}")
+    name = str(record.get("Package", "")).lower()
     section = record.get("Section", "").lower()
-    if any(word in section for word in ["admin", "kernel", "net", "utils", "system", "security"]):
-        add_check(checks, "sensitive_section", "Sensitive package section", "review", "medium", f"sensitive section: {section}")
+    high_impact_terms = {
+        "kernel": "kernel or boot path",
+        "auth": "authentication path",
+        "pam": "authentication path",
+        "sudo": "privilege management path",
+        "selinux": "mandatory access control path",
+        "firewall": "network security path",
+        "iptables": "network security path",
+        "nftables": "network security path",
+        "openssl": "cryptography path",
+        "gnutls": "cryptography path",
+        "openssh": "remote access path",
+    }
+    for term, meaning in high_impact_terms.items():
+        if term in name or term in section:
+            add_check(checks, "sensitive_section", "High-impact package area", "review", "medium", f"{meaning}: {section or name}")
+            break
     description = record.get("Description", "")
-    if re.search(r"\b(setuid|root|privilege|kernel module)\b", description, re.I):
+    if re.search(r"\b(setuid|setgid|privileged daemon|kernel module|loads? kernel modules?|grants? root|runs? as root)\b", description, re.I):
         add_check(checks, "privileged_behavior", "Privileged behavior signal", "review", "high", "description mentions privileged behavior")
     if re.search(r"\b(cve|vulnerab|exploit|security update|errata|advisory)\b", description, re.I):
         add_check(checks, "advisory_signal", "Advisory keyword signal", "review", "high", "description contains security advisory language")
@@ -536,7 +586,8 @@ def package_intelligence(package: dict[str, Any]) -> dict[str, Any]:
             findings = []
 
     category, responsibility = classify_package(name, section, description)
-    owner = maintainer or default_owner_for(category)
+    owner = default_owner_for(category)
+    upstream_maintainer = upstream_maintainer_label(maintainer)
     primary_purpose = first_sentence(description) or responsibility
     status = package.get("security_status") or "passed"
     failed_checks = [check for check in checks if check.get("status") == "failed"]
@@ -558,11 +609,20 @@ def package_intelligence(package: dict[str, Any]) -> dict[str, Any]:
         "responsibility": responsibility,
         "primary_purpose": primary_purpose,
         "operational_owner": owner,
+        "upstream_maintainer": upstream_maintainer,
         "impact": impact,
         "safety_summary": safety_summary,
         "why_not_safe": why_not_safe,
         "unsafe_check_ids": [check.get("id") for check in [*failed_checks, *review_checks] if check.get("id")],
     }
+
+
+def upstream_maintainer_label(value: str) -> str:
+    maintainer = " ".join((value or "").split())
+    if not maintainer:
+        return "Not declared in package metadata"
+    maintainer = re.sub(r"\s*<[^>]+@[^>]+>\s*", " (email present in package metadata)", maintainer)
+    return maintainer
 
 
 def classify_package(name: str, section: str, description: str) -> tuple[str, str]:
@@ -722,10 +782,10 @@ async def refresh_repo(repo: Repo) -> dict[str, Any]:
                     """
                     INSERT OR REPLACE INTO packages (
                       repo_name, package, version, architecture, section, priority,
-                      filename, size, sha256, maintainer, description,
+                      filename, size, sha256, checksum_algorithm, maintainer, description,
                       package_format, security_status, security_findings,
                       security_severity, security_risk_score, security_checks, refreshed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         repo.name,
@@ -737,6 +797,7 @@ async def refresh_repo(repo: Repo) -> dict[str, Any]:
                         record.get("Filename", ""),
                         int(record.get("Size", "0") or "0"),
                         record.get("SHA256", ""),
+                        detect_checksum_algorithm(str(record.get("SHA256", "") or ""), str(record.get("ChecksumType", "") or "")),
                         record.get("Maintainer", ""),
                         record.get("Description", ""),
                         record.get("PackageFormat", repo.repo_type),
@@ -785,6 +846,21 @@ def security_totals(conn: sqlite3.Connection) -> dict[str, Any]:
             """
         ).fetchone()
     )
+
+
+def verify_action_request(request: Request, x_pkgmng_token: str = "") -> None:
+    if ADMIN_TOKEN:
+        auth_header = request.headers.get("authorization", "")
+        bearer = auth_header.removeprefix("Bearer ").strip() if auth_header.startswith("Bearer ") else ""
+        if x_pkgmng_token != ADMIN_TOKEN and bearer != ADMIN_TOKEN:
+            raise HTTPException(status_code=401, detail="admin token required for state-changing package operations")
+    key = f"{request.client.host if request.client else 'unknown'}:{request.url.path}"
+    now = time.time()
+    previous = ACTION_LAST_RUN.get(key, 0)
+    if ACTION_RATE_LIMIT_SECONDS > 0 and now - previous < ACTION_RATE_LIMIT_SECONDS:
+        retry_after = int(ACTION_RATE_LIMIT_SECONDS - (now - previous))
+        raise HTTPException(status_code=429, detail=f"rate limited; retry after {retry_after} seconds")
+    ACTION_LAST_RUN[key] = now
 
 
 def highest_severity(totals: dict[str, Any]) -> str:
@@ -875,12 +951,14 @@ def readyz() -> dict[str, Any]:
 
 
 @app.post("/api/refresh")
-async def api_refresh() -> JSONResponse:
+async def api_refresh(request: Request, x_pkgmng_token: str = Header(default="")) -> JSONResponse:
+    verify_action_request(request, x_pkgmng_token)
     return JSONResponse({"results": await refresh_all("manual-refresh")})
 
 
 @app.post("/api/scans")
-async def api_scan() -> JSONResponse:
+async def api_scan(request: Request, x_pkgmng_token: str = Header(default="")) -> JSONResponse:
+    verify_action_request(request, x_pkgmng_token)
     return JSONResponse({"results": await refresh_all("manual-scan")})
 
 
@@ -982,21 +1060,41 @@ def api_security() -> dict[str, Any]:
             dict(row)
             for row in conn.execute(
                 """
-                SELECT packages.package, packages.version, packages.repo_name, packages.security_status,
+                SELECT packages.id, packages.package, packages.version, packages.architecture, packages.repo_name, packages.security_status,
                        packages.security_severity, packages.security_risk_score, packages.security_findings,
                        repos.distro_family, repos.release_version
                 FROM packages
                 JOIN repos ON repos.name = packages.repo_name
                 WHERE packages.security_status != 'passed'
-                ORDER BY packages.security_risk_score DESC, packages.package
-                LIMIT 25
+                ORDER BY packages.security_risk_score DESC, packages.security_status DESC, packages.package
+                LIMIT 200
                 """
             )
         ]
+        affected_counts = {
+            row["package"]: row["affected_variants"]
+            for row in conn.execute(
+                """
+                SELECT package, COUNT(*) affected_variants
+                FROM packages
+                WHERE security_status != 'passed'
+                GROUP BY package
+                """
+            )
+        }
+    seen_packages: set[str] = set()
+    deduped_top_risk: list[dict[str, Any]] = []
     for row in top_risk:
+        if row["package"] in seen_packages:
+            continue
+        seen_packages.add(row["package"])
         row["security_findings"] = json.loads(row["security_findings"])
+        row["affected_variants"] = affected_counts.get(row["package"], 1)
         row.update(package_intelligence(row))
-    return {"totals": totals, "by_family": by_family, "top_risk": top_risk}
+        deduped_top_risk.append(row)
+        if len(deduped_top_risk) >= 25:
+            break
+    return {"totals": totals, "by_family": by_family, "top_risk": deduped_top_risk}
 
 
 @app.get("/api/versions")
@@ -1048,6 +1146,7 @@ def api_packages(
     family: str = "",
     version: str = "",
     limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
     where: list[str] = []
     args: list[Any] = []
@@ -1063,20 +1162,29 @@ def api_packages(
     if version:
         where.append("repos.release_version = ?")
         args.append(version)
-    sql = """
+    base_sql = """
         SELECT packages.*, repos.distro_family, repos.release_version
         FROM packages
         JOIN repos ON repos.name = packages.repo_name
     """
+    count_sql = """
+        SELECT COUNT(*) total
+        FROM packages
+        JOIN repos ON repos.name = packages.repo_name
+    """
     if where:
-        sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY security_status DESC, package LIMIT ?"
-    args.append(limit)
+        where_sql = " WHERE " + " AND ".join(where)
+        base_sql += where_sql
+        count_sql += where_sql
+    sql = base_sql + " ORDER BY security_status DESC, package, version, architecture LIMIT ? OFFSET ?"
+    page_args = [*args, limit, offset]
     with closing(connect_db()) as conn:
-        rows = [dict(row) for row in conn.execute(sql, args)]
+        filtered_total = conn.execute(count_sql, args).fetchone()["total"]
+        rows = [dict(row) for row in conn.execute(sql, page_args)]
         for row in rows:
             row["security_findings"] = json.loads(row["security_findings"])
             row["security_checks"] = json.loads(row["security_checks"])
+            row["checksum_algorithm"] = row.get("checksum_algorithm") or detect_checksum_algorithm(str(row.get("sha256") or ""))
             row.update(package_intelligence(row))
         totals = dict(
             conn.execute(
@@ -1090,7 +1198,17 @@ def api_packages(
                 """
             ).fetchone()
         )
-    return {"packages": rows, "totals": totals}
+    return {
+        "packages": rows,
+        "totals": totals,
+        "page": {
+            "total": filtered_total,
+            "returned": len(rows),
+            "limit": limit,
+            "offset": offset,
+            "has_more": offset + len(rows) < filtered_total,
+        },
+    }
 
 
 @app.get("/api/packages/{package_id}")
@@ -1110,6 +1228,7 @@ def api_package(package_id: int) -> dict[str, Any]:
     item = dict(row)
     item["security_findings"] = json.loads(item["security_findings"])
     item["security_checks"] = json.loads(item["security_checks"])
+    item["checksum_algorithm"] = item.get("checksum_algorithm") or detect_checksum_algorithm(str(item.get("sha256") or ""))
     item.update(package_intelligence(item))
     item["remediation"] = [
         check.get("remediation", remediation_for(check.get("id", "metadata"), check.get("status", "review"), check.get("severity", "medium"), check.get("detail", "")))
@@ -1174,6 +1293,8 @@ def dashboard_html() -> str:
     .muted { color: var(--muted); }
     .toolbar { display:grid; grid-template-columns:minmax(240px,1fr) 170px 210px 170px; gap:12px; align-items:center; margin:16px 0; }
     input, select { width:100%; padding:0 14px; }
+    .page-controls { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin:0 0 12px; color:var(--muted); font-size:13px; }
+    .page-actions { display:flex; gap:10px; flex-wrap:wrap; }
     .metrics { display:grid; grid-template-columns:repeat(4,minmax(140px,1fr)); gap:12px; }
     .metric { border-radius:24px; padding:7px; background:rgba(16,20,24,.055); animation:rise .8s var(--ease) both; }
     .metric-inner { min-height:126px; border-radius:18px; background:rgba(255,255,255,.86); padding:18px; box-shadow:inset 0 1px 0 rgba(255,255,255,.9); }
@@ -1235,21 +1356,29 @@ def dashboard_html() -> str:
     .error { color: var(--bad); }
     .table-shell { border-radius:28px; padding:8px; background:rgba(16,20,24,.06); box-shadow:var(--shadow); }
     .table-wrap { border-radius:22px; overflow:auto; background:rgba(255,255,255,.9); max-height:720px; box-shadow:inset 0 1px 0 rgba(255,255,255,.86); }
-    table { width:100%; border-collapse:collapse; table-layout:fixed; min-width:1240px; }
+    table { width:100%; border-collapse:collapse; table-layout:fixed; min-width:1380px; }
     th, td { border-bottom:1px solid rgba(16,20,24,.08); padding:15px 14px; text-align:left; vertical-align:top; font-size:13px; }
     th { position:sticky; top:0; z-index:1; color:#34424e; background:rgba(255,255,255,.96); font-size:11px; text-transform:uppercase; letter-spacing:.13em; }
     td:nth-child(1) { width:14%; font-weight:750; }
     td:nth-child(2) { width:17%; overflow-wrap:anywhere; font-variant-numeric:tabular-nums; }
     td:nth-child(3) { width:11%; }
-    td:nth-child(4) { width:14%; }
-    td:nth-child(5), td:nth-child(6), td:nth-child(7), td:nth-child(8) { width:8%; }
-    td:nth-child(9), td:nth-child(10) { width:15%; }
+    td:nth-child(4) { width:7%; }
+    td:nth-child(5) { width:14%; }
+    td:nth-child(6), td:nth-child(7), td:nth-child(8), td:nth-child(9) { width:8%; }
+    td:nth-child(10), td:nth-child(11) { width:15%; }
     tbody tr { transition:background .45s var(--ease); }
     tbody tr:hover { background:rgba(10,111,100,.055); }
     .skeleton { position:relative; overflow:hidden; border-radius:14px; background:rgba(16,20,24,.08); min-height:18px; }
     .skeleton::after { content:""; position:absolute; inset:0; transform:translateX(-100%); background:linear-gradient(90deg, transparent, rgba(255,255,255,.75), transparent); animation:shimmer 1.2s infinite; }
     .state { width:min(420px, calc(100vw - 76px)); padding:34px; text-align:center; color:var(--muted); }
     .state strong { display:block; color:var(--ink); font-size:18px; margin-bottom:8px; }
+    .package-cards { display:none; gap:12px; }
+    .package-card { border-radius:18px; padding:15px; background:rgba(255,255,255,.9); border:1px solid rgba(16,20,24,.08); box-shadow:inset 0 1px 0 rgba(255,255,255,.9); }
+    .package-card h3 { margin:0 0 8px; font-size:17px; overflow-wrap:anywhere; }
+    .package-meta { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0 10px; }
+    .package-card dl { display:grid; gap:8px; margin:0; }
+    .package-card dt { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.11em; }
+    .package-card dd { margin:2px 0 0; line-height:1.35; overflow-wrap:anywhere; }
     footer { display:flex; justify-content:space-between; flex-wrap:wrap; gap:12px; padding:34px 0 0; color:var(--muted); font-size:13px; }
     @keyframes shimmer { to { transform:translateX(100%); } }
     @keyframes rise { from { opacity:0; transform:translateY(20px); } to { opacity:1; transform:translateY(0); } }
@@ -1266,6 +1395,8 @@ def dashboard_html() -> str:
       .scan-console { grid-template-columns:1fr; }
       .toolbar { grid-template-columns:1fr; }
       .section-head { align-items:flex-start; flex-direction:column; }
+      .table-wrap { display:none; }
+      .package-cards { display:grid; }
     }
   </style>
 </head>
@@ -1303,7 +1434,7 @@ def dashboard_html() -> str:
           <div class="eyebrow">Security validation</div>
           <h2>All package checks</h2>
         </div>
-        <p class="muted">Every indexed DEB and RPM record is scored for metadata integrity, trusted transport, update-channel context, sensitive behavior, package purpose, and operational impact.</p>
+        <p class="muted">Every indexed DEB and RPM record is scored for metadata integrity, trusted transport, update-channel context, package purpose, and operational impact.</p>
       </div>
       <section class="security-grid" id="security" aria-label="Package validation summary"></section>
       <div class="section-head">
@@ -1355,12 +1486,20 @@ def dashboard_html() -> str:
         </select>
       </div>
       <section class="table-shell" id="packages-table">
+        <div class="page-controls">
+          <span id="page-info">Loading package results...</span>
+          <div class="page-actions">
+            <button class="ghost" id="prev-page">Previous <span class="button-orb" aria-hidden="true">&lt;</span></button>
+            <button class="ghost" id="next-page">Next <span class="button-orb" aria-hidden="true">&gt;</span></button>
+          </div>
+        </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Package</th><th>Version</th><th>Repo</th><th>Responsible for</th><th>Format</th><th>Status</th><th>Severity</th><th>Risk</th><th>Why unsafe</th><th>Purpose</th></tr></thead>
+            <thead><tr><th>Package</th><th>Version</th><th>Repo</th><th>Arch</th><th>Responsible for</th><th>Format</th><th>Status</th><th>Severity</th><th>Risk</th><th>Why unsafe</th><th>Purpose</th></tr></thead>
             <tbody id="packages"></tbody>
           </table>
         </div>
+        <div class="package-cards" id="package-cards"></div>
       </section>
     </main>
     <footer>
@@ -1371,13 +1510,18 @@ def dashboard_html() -> str:
   <script>
     const $ = (id) => document.getElementById(id);
     const esc = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-    const skeletonRows = () => Array.from({length: 8}).map(() => '<tr><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td></tr>').join('');
+    const PAGE_LIMIT = 100;
+    let currentOffset = 0;
+    const skeletonRows = () => Array.from({length: 8}).map(() => '<tr><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td></tr>').join('');
+    const skeletonCards = () => Array.from({length: 4}).map(() => '<article class="package-card"><div class="skeleton"></div><br><div class="skeleton"></div><br><div class="skeleton"></div></article>').join('');
     const statusClass = (value) => ['passed', 'review', 'failed', 'pending'].includes(value) ? value : 'pending';
     const n = (value) => Number(value || 0).toLocaleString();
     async function load() {
       $('packages').innerHTML = skeletonRows();
+      $('package-cards').innerHTML = skeletonCards();
+      $('page-info').textContent = 'Loading package results...';
       try {
-        const params = new URLSearchParams({ q: $('q').value, status: $('status').value, family: $('family').value, version: $('version').value, limit: '300' });
+        const params = new URLSearchParams({ q: $('q').value, status: $('status').value, family: $('family').value, version: $('version').value, limit: String(PAGE_LIMIT), offset: String(currentOffset) });
         const [repos, families, versions, security, scans, packages] = await Promise.all([fetch('/api/repos').then(r => r.json()), fetch('/api/families').then(r => r.json()), fetch('/api/versions').then(r => r.json()), fetch('/api/security').then(r => r.json()), fetch('/api/scans').then(r => r.json()), fetch('/api/packages?' + params).then(r => r.json())]);
         const totals = packages.totals || {};
         $('hero-summary').innerHTML = [
@@ -1390,7 +1534,7 @@ def dashboard_html() -> str:
         const securityTotals = security.totals || {};
         const avgRisk = Math.max(0, Math.min(100, Number(securityTotals.avg_risk || 0)));
         const lanes = (security.by_family || []).slice(0, 10).map(row => `<div class="risk-item"><strong>${esc(row.distro_family)} v${esc(row.release_version || 'n/a')}</strong><span>${n(row.review)} review / ${n(row.failed)} failed</span></div>`).join('');
-        const topRisk = (security.top_risk || []).slice(0, 8).map(row => `<div class="risk-item"><strong>${esc(row.package)}</strong><span>${esc(row.security_severity)} - ${n(row.security_risk_score)}</span></div>`).join('');
+        const topRisk = (security.top_risk || []).slice(0, 8).map(row => `<div class="risk-item"><strong>${esc(row.package)}</strong><span>${esc(row.security_severity)} - ${n(row.security_risk_score)} / ${n(row.affected_variants || 1)} variants</span></div>`).join('');
         $('security').innerHTML = `<article class="security-panel"><div class="eyebrow">Average risk</div><h3>${avgRisk.toFixed(1)} / 100</h3><div class="risk-meter"><span style="width:${avgRisk}%"></span></div><p class="muted">${n(securityTotals.total)} packages scanned, ${n(securityTotals.critical)} critical metadata failures, ${n(securityTotals.high)} high review signals.</p><div class="risk-list">${lanes || '<div class="risk-item"><strong>No scan data</strong><span>refresh index</span></div>'}</div></article><article class="security-panel"><div class="eyebrow">Highest risk packages</div><h3>Validation queue</h3><div class="risk-list">${topRisk || '<div class="risk-item"><strong>No packages need review</strong><span>clear</span></div>'}</div></article>`;
         const currentRun = scans.current || {};
         const history = (scans.runs || []).map(run => `<div class="scan-run"><span class="badge ${run.status === 'succeeded' ? 'passed' : run.status === 'running' ? 'pending' : run.status === 'degraded' ? 'review' : 'failed'}">${esc(run.status)}</span><div><code>#${esc(run.id)} ${esc(run.trigger)}</code><br><span class="muted">${esc(run.started_at)}${run.finished_at ? ' to ' + esc(run.finished_at) : ''}</span></div><span>${n(run.packages_total)} pkgs</span></div>`).join('');
@@ -1398,7 +1542,7 @@ def dashboard_html() -> str:
         const remediationRows = (security.top_risk || []).slice(0, 4).map(row => `<div class="remediation-item"><strong>${esc(row.package)} <span class="badge ${esc(row.security_severity)}">${esc(row.security_severity)}</span></strong><span class="muted">${esc(row.responsibility || row.category || 'Package intelligence')}</span><br><span class="muted">${esc(row.why_not_safe || (row.security_findings || []).join('; ') || 'manual review')}</span></div>`).join('');
         $('remediation').innerHTML = `<div class="eyebrow">Remediation queue</div><h3>${n(securityTotals.review + securityTotals.failed)} actions</h3><p class="muted">Open a package row to see the exact owner, priority, evidence, and fix steps for each failed or review check.</p><div class="remediation-list">${remediationRows || '<div class="remediation-item"><strong>No active remediation</strong><span class="muted">All current package checks passed.</span></div>'}</div>`;
         $('run-scan-inline').addEventListener('click', runScan);
-        $('failed-inline').addEventListener('click', () => { $('status').value = 'failed'; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+        $('failed-inline').addEventListener('click', () => { $('status').value = 'failed'; currentOffset = 0; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
         const familyValue = $('family').value;
         $('family').innerHTML = '<option value="">All families</option>' + families.map(f => `<option value="${esc(f.distro_family)}">${esc(f.distro_family)}</option>`).join('');
         $('family').value = familyValue;
@@ -1409,13 +1553,21 @@ def dashboard_html() -> str:
         $('version').value = versionOptions.includes(versionValue) ? versionValue : '';
         $('families').innerHTML = families.length ? families.map(f => {
           const pills = (f.versions || []).map(v => `<span class="version-pill">v${esc(v.release_version)} - ${n(v.packages)} pkgs</span>`).join('');
-          return `<article class="family" data-family="${esc(f.distro_family)}"><h3><span class="family-dot"></span>${esc(f.distro_family)}</h3><dl><div><dt>Repos</dt><dd>${n(f.repos)}</dd></div><div><dt>Versions</dt><dd>${n(f.version_count)}</dd></div><div><dt>Healthy</dt><dd>${n(f.healthy)}</dd></div><div><dt>Errors</dt><dd>${n(f.errors)}</dd></div></dl><div class="version-strip">${pills || '<span class="version-pill">No versions</span>'}</div></article>`;
+          return `<article class="family" data-family="${esc(f.distro_family)}"><h3><span class="family-dot"></span>${esc(f.distro_family)}</h3><dl><div><dt>Repos</dt><dd>${n(f.repos)}</dd></div><div><dt>Versions</dt><dd>${n(f.version_count)}</dd></div><div><dt>Healthy mirrors</dt><dd>${n(f.healthy)}</dd></div><div><dt>Mirror sync errors</dt><dd>${n(f.errors)}</dd></div></dl><div class="version-strip">${pills || '<span class="version-pill">No versions</span>'}</div></article>`;
         }).join('') : '<article class="family"><h3><span class="family-dot"></span>No family data</h3></article>';
         $('repos').innerHTML = repos.length ? repos.map((r, i) => `<article class="repo" style="animation-delay:${i * 70}ms"><div class="repo-core"><h3>${esc(r.name)} <span class="badge ${r.status === 'ok' ? 'passed' : 'failed'}">${esc(r.status)}</span></h3><p><span class="badge pending">${esc(r.distro_family || (r.repo_type || 'apt').toUpperCase())}</span> <span class="badge pending">v${esc(r.release_version || 'n/a')}</span> <span class="badge pending">${esc((r.repo_type || 'apt').toUpperCase())}</span></p><p>${esc(r.base_url)}</p><p>${esc(r.suite)}/${esc(r.component)} - ${n(r.package_count)} packages</p><p>Refreshed ${esc(r.last_refresh || 'never')}</p>${r.error ? `<p class="error">${esc(r.error)}</p>` : ''}</div></article>`).join('') : '<article class="repo"><div class="repo-core"><h3>No repositories configured</h3><p>Add APT_REPOS or RPM_REPOS entries to begin indexing.</p></div></article>';
-        $('packages').innerHTML = packages.packages.length ? packages.packages.map(p => `<tr><td><button class="details-button" data-package-id="${esc(p.id)}">${esc(p.package)}</button></td><td>${esc(p.version)}</td><td>${esc(p.repo_name)}<br><span class="muted">${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</span></td><td>${esc(p.category)}<br><span class="muted">${esc(p.responsibility)}</span></td><td>${esc((p.package_format || 'deb').toUpperCase())}</td><td><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span></td><td><span class="badge ${esc(p.security_severity || 'none')}">${esc(p.security_severity || 'none')}</span></td><td>${n(p.security_risk_score)}</td><td>${esc(p.why_not_safe || 'none')}</td><td class="muted">${esc(p.primary_purpose || (p.description || '').split('\\n')[0])}</td></tr>`).join('') : '<tr><td colspan="6"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></td><td colspan="4"></td></tr>';
+        const page = packages.page || { total: packages.packages.length, returned: packages.packages.length, offset: currentOffset, limit: PAGE_LIMIT, has_more: false };
+        const start = page.total ? page.offset + 1 : 0;
+        const end = page.offset + page.returned;
+        $('page-info').textContent = `Showing ${n(start)}-${n(end)} of ${n(page.total)} matching packages`;
+        $('prev-page').disabled = page.offset <= 0;
+        $('next-page').disabled = !page.has_more;
+        $('packages').innerHTML = packages.packages.length ? packages.packages.map(p => `<tr><td><button class="details-button" data-package-id="${esc(p.id)}">${esc(p.package)}</button></td><td>${esc(p.version)}</td><td>${esc(p.repo_name)}<br><span class="muted">${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</span></td><td>${esc(p.architecture || 'n/a')}</td><td>${esc(p.category)}<br><span class="muted">${esc(p.responsibility)}</span></td><td>${esc((p.package_format || 'deb').toUpperCase())}<br><span class="muted">${esc((p.checksum_algorithm || '').toUpperCase())}</span></td><td><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span></td><td><span class="badge ${esc(p.security_severity || 'none')}">${esc(p.security_severity || 'none')}</span></td><td>${n(p.security_risk_score)}</td><td>${esc(p.why_not_safe || 'none')}</td><td class="muted">${esc(p.primary_purpose || (p.description || '').split('\\n')[0])}</td></tr>`).join('') : '<tr><td colspan="7"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></td><td colspan="4"></td></tr>';
+        $('package-cards').innerHTML = packages.packages.length ? packages.packages.map(p => `<article class="package-card"><h3><button class="details-button" data-package-id="${esc(p.id)}">${esc(p.package)}</button></h3><div class="package-meta"><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span><span class="badge ${esc(p.security_severity || 'none')}">${esc(p.security_severity || 'none')}</span><span class="badge pending">${esc(p.architecture || 'n/a')}</span><span class="badge pending">${esc((p.package_format || 'deb').toUpperCase())}</span></div><dl><div><dt>Version</dt><dd>${esc(p.version)}</dd></div><div><dt>Repo</dt><dd>${esc(p.repo_name)} · ${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</dd></div><div><dt>Responsible for</dt><dd>${esc(p.responsibility)}</dd></div><div><dt>Why unsafe</dt><dd>${esc(p.why_not_safe || 'none')}</dd></div><div><dt>Purpose</dt><dd>${esc(p.primary_purpose || (p.description || '').split('\\n')[0])}</dd></div></dl></article>`).join('') : '<article class="package-card"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></article>';
         document.querySelectorAll('.details-button').forEach(button => button.addEventListener('click', () => showPackage(button.dataset.packageId)));
       } catch (error) {
-        $('packages').innerHTML = `<tr><td colspan="9"><div class="state error"><strong>Could not load package data</strong>${esc(error.message || error)}</div></td></tr>`;
+        $('packages').innerHTML = `<tr><td colspan="11"><div class="state error"><strong>Could not load package data</strong>${esc(error.message || error)}</div></td></tr>`;
+        $('package-cards').innerHTML = `<article class="package-card"><div class="state error"><strong>Could not load package data</strong>${esc(error.message || error)}</div></article>`;
       }
     }
     async function runScan() {
@@ -1429,16 +1581,18 @@ def dashboard_html() -> str:
     async function showPackage(packageId) {
       const p = await fetch('/api/packages/' + encodeURIComponent(packageId)).then(r => r.json());
       const steps = (p.remediation || []).map(item => `<div class="remediation-item"><strong>${esc(item.action)} <span class="badge ${esc(item.priority === 'urgent' ? 'critical' : item.priority === 'high' ? 'high' : 'medium')}">${esc(item.priority)}</span></strong><span class="muted">${esc(item.owner)} - ${esc(item.evidence || '')}</span><ol>${(item.steps || []).map(step => `<li>${esc(step)}</li>`).join('')}</ol></div>`).join('');
-      $('remediation').innerHTML = `<div class="eyebrow">Package intelligence</div><h3>${esc(p.package)}</h3><div class="package-brief"><div class="brief-row"><span>Responsible for</span><strong>${esc(p.responsibility)}</strong></div><div class="brief-row"><span>Package purpose</span><strong>${esc(p.primary_purpose)}</strong></div><div class="brief-row"><span>Why it is not safe</span><strong>${esc(p.why_not_safe)}</strong></div><div class="brief-row"><span>Operational owner</span><strong>${esc(p.operational_owner)}</strong></div><div class="brief-row"><span>Impact</span><strong>${esc(p.impact)}</strong></div></div><p class="muted">${esc(p.recommended_action)}</p><div class="remediation-list">${steps || '<div class="remediation-item"><strong>No remediation required</strong><span class="muted">This package currently passes validation.</span></div>'}</div>`;
+      $('remediation').innerHTML = `<div class="eyebrow">Package intelligence</div><h3>${esc(p.package)}</h3><div class="package-brief"><div class="brief-row"><span>Responsible for</span><strong>${esc(p.responsibility)}</strong></div><div class="brief-row"><span>Package purpose</span><strong>${esc(p.primary_purpose)}</strong></div><div class="brief-row"><span>Why it is not safe</span><strong>${esc(p.why_not_safe)}</strong></div><div class="brief-row"><span>Internal owner lane</span><strong>${esc(p.operational_owner)}</strong></div><div class="brief-row"><span>Upstream maintainer from package metadata</span><strong>${esc(p.upstream_maintainer)}</strong></div><div class="brief-row"><span>Architecture</span><strong>${esc(p.architecture || 'n/a')}</strong></div><div class="brief-row"><span>Checksum algorithm</span><strong>${esc((p.checksum_algorithm || 'unknown').toUpperCase())}</strong></div><div class="brief-row"><span>Impact</span><strong>${esc(p.impact)}</strong></div></div><p class="muted">${esc(p.recommended_action)}</p><div class="remediation-list">${steps || '<div class="remediation-item"><strong>No remediation required</strong><span class="muted">This package currently passes validation.</span></div>'}</div>`;
       document.querySelector('.scan-console').scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
     $('refresh').addEventListener('click', async () => { $('refresh').disabled = true; $('refresh').innerHTML = 'Refreshing <span class="button-orb" aria-hidden="true">...</span>'; await fetch('/api/refresh', { method: 'POST' }); $('refresh').disabled = false; $('refresh').innerHTML = 'Refresh index <span class="button-orb" aria-hidden="true">+</span>'; load(); });
     $('scan').addEventListener('click', runScan);
-    $('show-review').addEventListener('click', () => { $('status').value = 'review'; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
-    $('q').addEventListener('input', () => clearTimeout(window.__t) || (window.__t = setTimeout(load, 250)));
-    $('status').addEventListener('change', load);
-    $('family').addEventListener('change', load);
-    $('version').addEventListener('change', load);
+    $('show-review').addEventListener('click', () => { $('status').value = 'review'; currentOffset = 0; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+    $('prev-page').addEventListener('click', () => { currentOffset = Math.max(0, currentOffset - PAGE_LIMIT); load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+    $('next-page').addEventListener('click', () => { currentOffset += PAGE_LIMIT; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+    $('q').addEventListener('input', () => clearTimeout(window.__t) || (window.__t = setTimeout(() => { currentOffset = 0; load(); }, 250)));
+    $('status').addEventListener('change', () => { currentOffset = 0; load(); });
+    $('family').addEventListener('change', () => { currentOffset = 0; load(); });
+    $('version').addEventListener('change', () => { currentOffset = 0; load(); });
     load();
   </script>
 </body>
