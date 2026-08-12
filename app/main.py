@@ -52,7 +52,7 @@ RPM_REPOS = os.getenv(
     "redhat-ubi8-baseos|https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi8/8/x86_64/baseos/os/|Red Hat UBI 8|BaseOS",
 )
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))
-MAX_PACKAGES_PER_REPO = int(os.getenv("MAX_PACKAGES_PER_REPO", "2500"))
+MAX_PACKAGES_PER_REPO = int(os.getenv("MAX_PACKAGES_PER_REPO", "0"))
 
 
 @dataclass(frozen=True)
@@ -164,6 +164,9 @@ def init_db() -> None:
               package_format TEXT NOT NULL DEFAULT 'deb',
               security_status TEXT NOT NULL,
               security_findings TEXT NOT NULL,
+              security_severity TEXT NOT NULL DEFAULT 'none',
+              security_risk_score INTEGER NOT NULL DEFAULT 0,
+              security_checks TEXT NOT NULL DEFAULT '[]',
               refreshed_at TEXT NOT NULL,
               UNIQUE(repo_name, package, version, architecture)
             );
@@ -175,6 +178,9 @@ def init_db() -> None:
         ensure_column(conn, "repos", "distro_family", "TEXT NOT NULL DEFAULT 'Debian'")
         ensure_column(conn, "repos", "release_version", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "packages", "package_format", "TEXT NOT NULL DEFAULT 'deb'")
+        ensure_column(conn, "packages", "security_severity", "TEXT NOT NULL DEFAULT 'none'")
+        ensure_column(conn, "packages", "security_risk_score", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "packages", "security_checks", "TEXT NOT NULL DEFAULT '[]'")
         repos = configured_repos()
         repo_names = [repo.name for repo in repos]
         if repo_names:
@@ -273,7 +279,7 @@ def parse_rpm_primary_stream(stream: Any, limit: int | None = None) -> list[dict
             }
         )
         package.clear()
-        if limit is not None and len(records) >= limit:
+        if limit and len(records) >= limit:
             break
     return records
 
@@ -305,28 +311,85 @@ def rpm_primary_href(repomd_xml: str) -> str:
     raise RuntimeError("repomd.xml did not include primary metadata")
 
 
-def assess_package(record: dict[str, Any]) -> tuple[str, list[str]]:
-    findings: list[str] = []
+def package_limit() -> int | None:
+    return MAX_PACKAGES_PER_REPO if MAX_PACKAGES_PER_REPO > 0 else None
+
+
+def add_check(checks: list[dict[str, Any]], check_id: str, label: str, status: str, severity: str, detail: str) -> None:
+    checks.append({"id": check_id, "label": label, "status": status, "severity": severity, "detail": detail})
+
+
+def validate_package(record: dict[str, Any], repo: Repo | None = None) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
     package_format = record.get("PackageFormat", "deb")
-    if not record.get("SHA256"):
-        findings.append("missing SHA256 checksum")
+    filename = record.get("Filename", "")
+    sha256 = record.get("SHA256", "")
+    size = int(record.get("Size", "0") or "0")
     expected_suffix = ".rpm" if package_format == "rpm" else ".deb"
-    if not record.get("Filename", "").endswith(expected_suffix):
-        findings.append(f"package filename is not a {expected_suffix}")
+
+    if sha256 and re.fullmatch(r"[A-Fa-f0-9]{64}", sha256):
+        add_check(checks, "checksum", "SHA256 checksum", "passed", "none", "valid 64-character checksum")
+    elif sha256:
+        add_check(checks, "checksum", "SHA256 checksum", "failed", "critical", "checksum is present but not a valid SHA256 hex digest")
+    else:
+        add_check(checks, "checksum", "SHA256 checksum", "failed", "critical", "missing SHA256 checksum")
+
+    if filename.endswith(expected_suffix):
+        add_check(checks, "artifact_type", "Package artifact type", "passed", "none", f"filename ends with {expected_suffix}")
+    else:
+        add_check(checks, "artifact_type", "Package artifact type", "failed", "critical", f"package filename is not a {expected_suffix}")
+
+    if size > 0:
+        add_check(checks, "declared_size", "Declared package size", "passed", "none", "repository metadata includes package size")
+    else:
+        add_check(checks, "declared_size", "Declared package size", "review", "medium", "package size is missing or zero")
+
+    repo_family = repo.distro_family if repo else ""
+    repo_name = repo.name if repo else str(record.get("RepoName", ""))
+    if repo and repo.base_url.startswith("https://"):
+        add_check(checks, "transport", "Repository transport", "passed", "none", "repository metadata fetched over HTTPS")
+    elif repo:
+        add_check(checks, "transport", "Repository transport", "review", "medium", "repository metadata fetched without HTTPS")
+
+    if repo and ("security" in repo_name.lower() or "security" in repo.component.lower()):
+        add_check(checks, "security_channel", "Security channel", "review", "high", "package is published through a security update channel")
+    elif repo:
+        add_check(checks, "security_channel", "Security channel", "passed", "none", f"package is indexed from {repo_family or repo.repo_type} repository metadata")
+
+    expected_suffix = ".rpm" if package_format == "rpm" else ".deb"
     priority = record.get("Priority", "").lower()
     if priority in {"required", "important"}:
-        findings.append(f"high-impact priority: {priority}")
+        add_check(checks, "priority", "High-impact priority", "review", "high", f"high-impact priority: {priority}")
     section = record.get("Section", "").lower()
     if any(word in section for word in ["admin", "kernel", "net", "utils", "system", "security"]):
-        findings.append(f"sensitive section: {section}")
+        add_check(checks, "sensitive_section", "Sensitive package section", "review", "medium", f"sensitive section: {section}")
     description = record.get("Description", "")
     if re.search(r"\b(setuid|root|privilege|kernel module)\b", description, re.I):
-        findings.append("description mentions privileged behavior")
-    if not findings:
-        return "passed", []
-    if any("missing" in item or f"not a {expected_suffix}" in item for item in findings):
-        return "failed", findings
-    return "review", findings
+        add_check(checks, "privileged_behavior", "Privileged behavior signal", "review", "high", "description mentions privileged behavior")
+    if re.search(r"\b(cve|vulnerab|exploit|security update|errata|advisory)\b", description, re.I):
+        add_check(checks, "advisory_signal", "Advisory keyword signal", "review", "high", "description contains security advisory language")
+
+    if not checks:
+        add_check(checks, "metadata", "Baseline metadata", "passed", "none", "package metadata has no review triggers")
+
+    severity_rank = {"none": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+    status_rank = {"passed": 0, "review": 1, "failed": 2}
+    severity = max((check["severity"] for check in checks), key=lambda value: severity_rank.get(value, 0))
+    status = max((check["status"] for check in checks), key=lambda value: status_rank.get(value, 0))
+    findings = [check["detail"] for check in checks if check["status"] != "passed"]
+    risk_score = sum({"none": 0, "low": 5, "medium": 15, "high": 30, "critical": 60}.get(check["severity"], 0) for check in checks)
+    return {
+        "status": status,
+        "severity": severity,
+        "risk_score": min(risk_score, 100),
+        "findings": findings,
+        "checks": checks,
+    }
+
+
+def assess_package(record: dict[str, Any]) -> tuple[str, list[str]]:
+    profile = validate_package(record)
+    return profile["status"], profile["findings"]
 
 
 async def fetch_packages_text(repo: Repo) -> str:
@@ -361,19 +424,23 @@ async def fetch_rpm_records(repo: Repo) -> list[dict[str, Any]]:
             spool.seek(0)
             if primary_url.endswith(".gz"):
                 with gzip.open(spool.name, "rt", encoding="utf-8", errors="replace") as stream:
-                    return parse_rpm_primary_stream(stream, MAX_PACKAGES_PER_REPO)
+                    return parse_rpm_primary_stream(stream, package_limit())
             if primary_url.endswith(".xz"):
                 with lzma.open(spool.name, "rt", encoding="utf-8", errors="replace") as stream:
-                    return parse_rpm_primary_stream(stream, MAX_PACKAGES_PER_REPO)
+                    return parse_rpm_primary_stream(stream, package_limit())
             with open(spool.name, encoding="utf-8", errors="replace") as stream:
-                return parse_rpm_primary_stream(stream, MAX_PACKAGES_PER_REPO)
+                return parse_rpm_primary_stream(stream, package_limit())
 
 
 async def repo_records(repo: Repo) -> list[dict[str, Any]]:
     if repo.repo_type == "rpm":
         return await fetch_rpm_records(repo)
     text = await fetch_packages_text(repo)
-    return [{**record, "PackageFormat": "deb"} for record in parse_packages_index(text)[:MAX_PACKAGES_PER_REPO]]
+    records = parse_packages_index(text)
+    limit = package_limit()
+    if limit:
+        records = records[:limit]
+    return [{**record, "PackageFormat": "deb"} for record in records]
 
 
 async def refresh_repo(repo: Repo) -> dict[str, Any]:
@@ -384,14 +451,15 @@ async def refresh_repo(repo: Repo) -> dict[str, Any]:
         with closing(connect_db()) as conn:
             conn.execute("DELETE FROM packages WHERE repo_name = ?", (repo.name,))
             for record in records:
-                status, findings = assess_package(record)
+                profile = validate_package(record, repo)
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO packages (
                       repo_name, package, version, architecture, section, priority,
                       filename, size, sha256, maintainer, description,
-                      package_format, security_status, security_findings, refreshed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      package_format, security_status, security_findings,
+                      security_severity, security_risk_score, security_checks, refreshed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         repo.name,
@@ -406,8 +474,11 @@ async def refresh_repo(repo: Repo) -> dict[str, Any]:
                         record.get("Maintainer", ""),
                         record.get("Description", ""),
                         record.get("PackageFormat", repo.repo_type),
-                        status,
-                        json.dumps(findings),
+                        profile["status"],
+                        json.dumps(profile["findings"]),
+                        profile["severity"],
+                        profile["risk_score"],
+                        json.dumps(profile["checks"]),
                         refreshed_at,
                     ),
                 )
@@ -522,6 +593,66 @@ def api_families() -> list[dict[str, Any]]:
     return families
 
 
+@app.get("/api/security")
+def api_security() -> dict[str, Any]:
+    with closing(connect_db()) as conn:
+        totals = dict(
+            conn.execute(
+                """
+                SELECT
+                  COUNT(*) total,
+                  COALESCE(SUM(security_status='passed'), 0) passed,
+                  COALESCE(SUM(security_status='review'), 0) review,
+                  COALESCE(SUM(security_status='failed'), 0) failed,
+                  COALESCE(SUM(security_severity='critical'), 0) critical,
+                  COALESCE(SUM(security_severity='high'), 0) high,
+                  COALESCE(SUM(security_severity='medium'), 0) medium,
+                  COALESCE(ROUND(AVG(security_risk_score), 1), 0) avg_risk
+                FROM packages
+                """
+            ).fetchone()
+        )
+        by_family = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT
+                  repos.distro_family,
+                  repos.release_version,
+                  COUNT(*) total,
+                  COALESCE(SUM(packages.security_status='passed'), 0) passed,
+                  COALESCE(SUM(packages.security_status='review'), 0) review,
+                  COALESCE(SUM(packages.security_status='failed'), 0) failed,
+                  COALESCE(SUM(packages.security_severity='critical'), 0) critical,
+                  COALESCE(SUM(packages.security_severity='high'), 0) high,
+                  COALESCE(ROUND(AVG(packages.security_risk_score), 1), 0) avg_risk
+                FROM packages
+                JOIN repos ON repos.name = packages.repo_name
+                GROUP BY repos.distro_family, repos.release_version
+                ORDER BY repos.distro_family, CAST(repos.release_version AS INTEGER) DESC
+                """
+            )
+        ]
+        top_risk = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT packages.package, packages.version, packages.repo_name, packages.security_status,
+                       packages.security_severity, packages.security_risk_score, packages.security_findings,
+                       repos.distro_family, repos.release_version
+                FROM packages
+                JOIN repos ON repos.name = packages.repo_name
+                WHERE packages.security_status != 'passed'
+                ORDER BY packages.security_risk_score DESC, packages.package
+                LIMIT 25
+                """
+            )
+        ]
+    for row in top_risk:
+        row["security_findings"] = json.loads(row["security_findings"])
+    return {"totals": totals, "by_family": by_family, "top_risk": top_risk}
+
+
 @app.get("/api/versions")
 def api_versions() -> list[dict[str, Any]]:
     with closing(connect_db()) as conn:
@@ -599,14 +730,15 @@ def api_packages(
         rows = [dict(row) for row in conn.execute(sql, args)]
         for row in rows:
             row["security_findings"] = json.loads(row["security_findings"])
+            row["security_checks"] = json.loads(row["security_checks"])
         totals = dict(
             conn.execute(
                 """
                 SELECT
                   COUNT(*) total,
-                  SUM(security_status='passed') passed,
-                  SUM(security_status='review') review,
-                  SUM(security_status='failed') failed
+                  COALESCE(SUM(security_status='passed'), 0) passed,
+                  COALESCE(SUM(security_status='review'), 0) review,
+                  COALESCE(SUM(security_status='failed'), 0) failed
                 FROM packages
                 """
             ).fetchone()
@@ -683,10 +815,23 @@ def dashboard_html() -> str:
     .family dd { margin:2px 0 0; font-size:22px; font-weight:760; font-variant-numeric:tabular-nums; }
     .version-strip { display:flex; flex-wrap:wrap; gap:6px; margin-top:14px; }
     .version-pill { display:inline-flex; align-items:center; min-height:28px; border-radius:999px; padding:4px 9px; background:rgba(16,20,24,.07); color:#27333d; font-size:12px; font-weight:740; }
+    .security-grid { display:grid; grid-template-columns:minmax(280px,.85fr) minmax(360px,1.15fr); gap:14px; margin:0 0 34px; }
+    .security-panel { border-radius:22px; padding:18px; background:rgba(255,255,255,.84); border:1px solid rgba(16,20,24,.08); box-shadow:inset 0 1px 0 rgba(255,255,255,.9); }
+    .security-panel h3 { margin:8px 0 0; font-size:clamp(28px,4vw,52px); line-height:1; font-variant-numeric:tabular-nums; }
+    .risk-meter { height:12px; border-radius:999px; overflow:hidden; background:rgba(16,20,24,.1); margin:18px 0 8px; }
+    .risk-meter span { display:block; height:100%; width:0; background:linear-gradient(90deg, var(--ok), var(--warn), var(--bad)); border-radius:999px; }
+    .risk-list { display:grid; gap:8px; margin-top:14px; }
+    .risk-item { display:grid; grid-template-columns:1fr auto; gap:10px; align-items:center; padding:10px 0; border-top:1px solid rgba(16,20,24,.08); }
+    .risk-item strong { font-size:13px; overflow-wrap:anywhere; }
+    .risk-item span { color:var(--muted); font-size:12px; text-align:right; }
     .badge { display:inline-flex; align-items:center; border-radius:999px; padding:5px 10px; font-size:12px; font-weight:720; text-transform:uppercase; letter-spacing:.08em; }
     .passed { color:#063f27; background:rgba(8,116,67,.13); }
     .review { color:#62440a; background:rgba(138,100,26,.16); }
     .failed { color:#761d18; background:rgba(169,52,44,.14); }
+    .critical { color:#761d18; background:rgba(169,52,44,.18); }
+    .high { color:#62440a; background:rgba(138,100,26,.18); }
+    .medium { color:#27333d; background:rgba(64,74,85,.12); }
+    .none { color:#063f27; background:rgba(8,116,67,.11); }
     .pending { color:#404a55; background:rgba(64,74,85,.12); }
     .error { color: var(--bad); }
     .table-shell { border-radius:28px; padding:8px; background:rgba(16,20,24,.06); box-shadow:var(--shadow); }
@@ -697,7 +842,7 @@ def dashboard_html() -> str:
     td:nth-child(1) { width:16%; font-weight:750; }
     td:nth-child(2) { width:20%; overflow-wrap:anywhere; font-variant-numeric:tabular-nums; }
     td:nth-child(3), td:nth-child(4) { width:9%; }
-    td:nth-child(5) { width:12%; }
+    td:nth-child(5), td:nth-child(6) { width:10%; }
     tbody tr { transition:background .45s var(--ease); }
     tbody tr:hover { background:rgba(10,111,100,.055); }
     .skeleton { position:relative; overflow:hidden; border-radius:14px; background:rgba(16,20,24,.08); min-height:18px; }
@@ -716,6 +861,7 @@ def dashboard_html() -> str:
       h1 { font-size:clamp(40px,14vw,56px); overflow-wrap:anywhere; }
       .hero-core { min-height:260px; }
       .metrics { grid-template-columns:repeat(2,minmax(120px,1fr)); }
+      .security-grid { grid-template-columns:1fr; }
       .toolbar { grid-template-columns:1fr; }
       .section-head { align-items:flex-start; flex-direction:column; }
     }
@@ -749,6 +895,14 @@ def dashboard_html() -> str:
     </header>
     <main id="content">
       <section class="metrics" id="metrics" aria-label="Package security totals"></section>
+      <div class="section-head">
+        <div>
+          <div class="eyebrow">Security validation</div>
+          <h2>All package checks</h2>
+        </div>
+        <p class="muted">Every indexed DEB and RPM record is scored for metadata integrity, trusted transport, update-channel context, and sensitive package behavior.</p>
+      </div>
+      <section class="security-grid" id="security" aria-label="Package validation summary"></section>
       <div class="section-head">
         <div>
           <div class="eyebrow">RHEL-family coverage</div>
@@ -789,7 +943,7 @@ def dashboard_html() -> str:
       <section class="table-shell" id="packages-table">
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Package</th><th>Version</th><th>Repo</th><th>Format</th><th>Status</th><th>Section</th><th>Findings</th><th>Description</th></tr></thead>
+            <thead><tr><th>Package</th><th>Version</th><th>Repo</th><th>Format</th><th>Status</th><th>Severity</th><th>Risk</th><th>Findings</th><th>Description</th></tr></thead>
             <tbody id="packages"></tbody>
           </table>
         </div>
@@ -803,14 +957,14 @@ def dashboard_html() -> str:
   <script>
     const $ = (id) => document.getElementById(id);
     const esc = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-    const skeletonRows = () => Array.from({length: 8}).map(() => '<tr><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td></tr>').join('');
+    const skeletonRows = () => Array.from({length: 8}).map(() => '<tr><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td></tr>').join('');
     const statusClass = (value) => ['passed', 'review', 'failed', 'pending'].includes(value) ? value : 'pending';
     const n = (value) => Number(value || 0).toLocaleString();
     async function load() {
       $('packages').innerHTML = skeletonRows();
       try {
         const params = new URLSearchParams({ q: $('q').value, status: $('status').value, family: $('family').value, version: $('version').value, limit: '300' });
-        const [repos, families, versions, packages] = await Promise.all([fetch('/api/repos').then(r => r.json()), fetch('/api/families').then(r => r.json()), fetch('/api/versions').then(r => r.json()), fetch('/api/packages?' + params).then(r => r.json())]);
+        const [repos, families, versions, security, packages] = await Promise.all([fetch('/api/repos').then(r => r.json()), fetch('/api/families').then(r => r.json()), fetch('/api/versions').then(r => r.json()), fetch('/api/security').then(r => r.json()), fetch('/api/packages?' + params).then(r => r.json())]);
         const totals = packages.totals || {};
         $('hero-summary').innerHTML = [
           ['Indexed packages', n(totals.total)],
@@ -819,6 +973,11 @@ def dashboard_html() -> str:
           ['Refresh cadence', '6h']
         ].map(([k,v]) => `<div class="scanline"><span>${k}</span><strong>${v}</strong></div>`).join('');
         $('metrics').innerHTML = [['Total', totals.total], ['Passed', totals.passed], ['Review', totals.review], ['Failed', totals.failed]].map(([k,v], i) => `<article class="metric" style="animation-delay:${i * 60}ms"><div class="metric-inner"><strong>${n(v)}</strong><span>${k}</span></div></article>`).join('');
+        const securityTotals = security.totals || {};
+        const avgRisk = Math.max(0, Math.min(100, Number(securityTotals.avg_risk || 0)));
+        const lanes = (security.by_family || []).slice(0, 10).map(row => `<div class="risk-item"><strong>${esc(row.distro_family)} v${esc(row.release_version || 'n/a')}</strong><span>${n(row.review)} review / ${n(row.failed)} failed</span></div>`).join('');
+        const topRisk = (security.top_risk || []).slice(0, 8).map(row => `<div class="risk-item"><strong>${esc(row.package)}</strong><span>${esc(row.security_severity)} - ${n(row.security_risk_score)}</span></div>`).join('');
+        $('security').innerHTML = `<article class="security-panel"><div class="eyebrow">Average risk</div><h3>${avgRisk.toFixed(1)} / 100</h3><div class="risk-meter"><span style="width:${avgRisk}%"></span></div><p class="muted">${n(securityTotals.total)} packages scanned, ${n(securityTotals.critical)} critical metadata failures, ${n(securityTotals.high)} high review signals.</p><div class="risk-list">${lanes || '<div class="risk-item"><strong>No scan data</strong><span>refresh index</span></div>'}</div></article><article class="security-panel"><div class="eyebrow">Highest risk packages</div><h3>Validation queue</h3><div class="risk-list">${topRisk || '<div class="risk-item"><strong>No packages need review</strong><span>clear</span></div>'}</div></article>`;
         const familyValue = $('family').value;
         $('family').innerHTML = '<option value="">All families</option>' + families.map(f => `<option value="${esc(f.distro_family)}">${esc(f.distro_family)}</option>`).join('');
         $('family').value = familyValue;
@@ -832,9 +991,9 @@ def dashboard_html() -> str:
           return `<article class="family" data-family="${esc(f.distro_family)}"><h3><span class="family-dot"></span>${esc(f.distro_family)}</h3><dl><div><dt>Repos</dt><dd>${n(f.repos)}</dd></div><div><dt>Versions</dt><dd>${n(f.version_count)}</dd></div><div><dt>Healthy</dt><dd>${n(f.healthy)}</dd></div><div><dt>Errors</dt><dd>${n(f.errors)}</dd></div></dl><div class="version-strip">${pills || '<span class="version-pill">No versions</span>'}</div></article>`;
         }).join('') : '<article class="family"><h3><span class="family-dot"></span>No family data</h3></article>';
         $('repos').innerHTML = repos.length ? repos.map((r, i) => `<article class="repo" style="animation-delay:${i * 70}ms"><div class="repo-core"><h3>${esc(r.name)} <span class="badge ${r.status === 'ok' ? 'passed' : 'failed'}">${esc(r.status)}</span></h3><p><span class="badge pending">${esc(r.distro_family || (r.repo_type || 'apt').toUpperCase())}</span> <span class="badge pending">v${esc(r.release_version || 'n/a')}</span> <span class="badge pending">${esc((r.repo_type || 'apt').toUpperCase())}</span></p><p>${esc(r.base_url)}</p><p>${esc(r.suite)}/${esc(r.component)} - ${n(r.package_count)} packages</p><p>Refreshed ${esc(r.last_refresh || 'never')}</p>${r.error ? `<p class="error">${esc(r.error)}</p>` : ''}</div></article>`).join('') : '<article class="repo"><div class="repo-core"><h3>No repositories configured</h3><p>Add APT_REPOS or RPM_REPOS entries to begin indexing.</p></div></article>';
-        $('packages').innerHTML = packages.packages.length ? packages.packages.map(p => `<tr><td>${esc(p.package)}</td><td>${esc(p.version)}</td><td>${esc(p.repo_name)}<br><span class="muted">${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</span></td><td>${esc((p.package_format || 'deb').toUpperCase())}</td><td><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span></td><td>${esc(p.section || '')}</td><td>${esc((p.security_findings || []).join('; ') || 'none')}</td><td class="muted">${esc((p.description || '').split('\\n')[0])}</td></tr>`).join('') : '<tr><td colspan="4"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></td><td colspan="4"></td></tr>';
+        $('packages').innerHTML = packages.packages.length ? packages.packages.map(p => `<tr><td>${esc(p.package)}</td><td>${esc(p.version)}</td><td>${esc(p.repo_name)}<br><span class="muted">${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</span></td><td>${esc((p.package_format || 'deb').toUpperCase())}</td><td><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span></td><td><span class="badge ${esc(p.security_severity || 'none')}">${esc(p.security_severity || 'none')}</span></td><td>${n(p.security_risk_score)}</td><td>${esc((p.security_findings || []).join('; ') || 'none')}</td><td class="muted">${esc((p.description || '').split('\\n')[0])}</td></tr>`).join('') : '<tr><td colspan="5"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></td><td colspan="4"></td></tr>';
       } catch (error) {
-        $('packages').innerHTML = `<tr><td colspan="7"><div class="state error"><strong>Could not load package data</strong>${esc(error.message || error)}</div></td></tr>`;
+        $('packages').innerHTML = `<tr><td colspan="9"><div class="state error"><strong>Could not load package data</strong>${esc(error.message || error)}</div></td></tr>`;
       }
     }
     $('refresh').addEventListener('click', async () => { $('refresh').disabled = true; $('refresh').innerHTML = 'Refreshing <span class="button-orb" aria-hidden="true">...</span>'; await fetch('/api/refresh', { method: 'POST' }); $('refresh').disabled = false; $('refresh').innerHTML = 'Refresh index <span class="button-orb" aria-hidden="true">+</span>'; load(); });

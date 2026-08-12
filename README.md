@@ -1,12 +1,13 @@
 # pkgmng
 
-`pkgmng` is a Linux repository manager for APT and RHEL-family RPM sources. It indexes configured repositories, refreshes package metadata on a schedule, runs lightweight security checks on package records, and exposes a web UI plus JSON APIs.
+`pkgmng` is a Linux repository manager for APT and RHEL-family RPM sources. It indexes configured repositories, refreshes package metadata on a schedule, runs security validation on every indexed package record, and exposes a web UI plus JSON APIs.
 
 ## Runtime
 
 - App: FastAPI
 - Port: `8080`
 - Data: SQLite at `DB_PATH`, default `/data/pkgmng.db` in the container
+- Package cap: `MAX_PACKAGES_PER_REPO=0` scans all package metadata; set a positive value only as an emergency runtime cap
 - Default repositories:
   - Debian 13, 12, and 11 main
   - Debian 13, 12, and 11 security
@@ -42,6 +43,18 @@ alma-10-baseos|https://repo.almalinux.org/almalinux/10/BaseOS/x86_64/os/|AlmaLin
 ```
 
 The UI exposes a distribution-family summary, version lanes, and package filters by Debian, AlmaLinux, Rocky Linux, Oracle Linux, Red Hat, and OS version.
+
+## Security validation
+
+Every indexed DEB and RPM package receives a structured validation profile:
+
+- `security_status`: `passed`, `review`, or `failed`
+- `security_severity`: `none`, `medium`, `high`, or `critical`
+- `security_risk_score`: normalized `0-100` metadata risk score
+- `security_findings`: concise operator-facing findings
+- `security_checks`: individual checks for checksum integrity, artifact type, declared size, repository transport, security update channel, sensitive sections, high-impact priorities, privileged behavior, and advisory keyword signals
+
+The `/api/security` endpoint returns global totals, OS/version breakdowns, and the highest-risk package records. The dashboard renders the same data in the "All package checks" panel and the package inventory table.
 
 ## Development
 
