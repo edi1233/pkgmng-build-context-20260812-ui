@@ -52,18 +52,21 @@ Every indexed DEB and RPM package receives a structured validation profile:
 - `security_severity`: `none`, `medium`, `high`, or `critical`
 - `security_risk_score`: normalized `0-100` metadata risk score
 - `security_findings`: concise operator-facing findings
-- `security_checks`: individual checks for checksum integrity, artifact type, declared size, repository transport, security update channel, sensitive sections, high-impact priorities, privileged behavior, and advisory keyword signals
+- `security_checks`: individual checks for checksum integrity, artifact type, declared size, repository transport, security update channel context, sensitive package areas, high-impact priorities, privileged behavior, and advisory keyword signals
 
 Checksum validation detects the algorithm published by repository metadata where available and falls back to digest length (`40=SHA-1`, `64=SHA-256`, `128=SHA-512`). Legacy RPM repositories that publish SHA-1 metadata are treated as valid metadata instead of critical checksum failures; malformed or unknown digest formats still fail.
 
 Sensitive package review is intentionally weighted toward high-impact areas such as kernel, authentication, privilege management, cryptography, firewall, and remote access. Generic `admin`, `system`, `utils`, or `net` package sections are not failed on section text alone.
 
+Official security update channels are treated as positive source context, not as a risk finding. Packages only enter review when the scanner has concrete evidence such as a high-impact package name/section, priority, privileged behavior wording, advisory wording, or incomplete artifact metadata.
+
 The `/api/security` endpoint returns global totals, OS/version breakdowns, and the highest-risk package records. The dashboard renders the same data in the "All package checks" panel and the package inventory table.
 
 ## Scan and remediation workflow
 
-- `POST /api/scans` launches a repository refresh plus full package validation run.
-- `GET /api/scans` returns recent scan runs with status, trigger, repository health, total packages, pass/review/fail counts, and highest severity.
+- `POST /api/scans` launches a repository refresh plus full package validation run with trigger `manual`.
+- Scheduled refreshes record trigger `scheduled`; API refreshes record trigger `manual-refresh`.
+- `GET /api/scans` returns recent scan runs with status, trigger, repository health, total packages, pass/review/fail counts, and highest severity. It also marks orphaned `running` scans older than `SCAN_STALE_MINUTES` as failed.
 - `GET /api/packages/{id}` returns the package validation profile with remediation guidance.
 - The UI includes a scan operations panel, scan history, a remediation queue, and package-row detail actions.
 - `GET /api/packages` supports `limit` and `offset` pagination and returns `page.total`, `page.returned`, `page.offset`, and `page.has_more`.
@@ -71,6 +74,8 @@ The `/api/security` endpoint returns global totals, OS/version breakdowns, and t
 - Package detail distinguishes the internal owner lane from the upstream maintainer recorded in package metadata.
 
 State-changing endpoints (`POST /api/refresh`, `POST /api/scans`) support `Authorization: Bearer <ADMIN_TOKEN>` or `X-Pkgmng-Token` when `ADMIN_TOKEN` is configured, and apply a per-client rate limit controlled by `ACTION_RATE_LIMIT_SECONDS`.
+
+Only one scan can run at a time. A second scan request receives HTTP `409` with the active scan id until the current scan completes or the stale-run watchdog marks it failed.
 
 Remediation is generated from the failing or review checks. Each remediation item includes:
 

@@ -12,7 +12,7 @@ import time
 import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager, closing
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +55,7 @@ HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))
 MAX_PACKAGES_PER_REPO = int(os.getenv("MAX_PACKAGES_PER_REPO", "0"))
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 ACTION_RATE_LIMIT_SECONDS = int(os.getenv("ACTION_RATE_LIMIT_SECONDS", "300"))
+SCAN_STALE_MINUTES = int(os.getenv("SCAN_STALE_MINUTES", "120"))
 ACTION_LAST_RUN: dict[str, float] = {}
 
 
@@ -110,6 +111,13 @@ class Repo:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def parse_iso(value: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
 
 
 def parse_repos(raw: str = APT_REPOS, repo_type: str = "apt") -> list[Repo]:
@@ -417,12 +425,12 @@ def remediation_for(check_id: str, status: str, severity: str, detail: str) -> d
             ],
         },
         "security_channel": {
-            "action": "Review security-channel package before fleet rollout",
-            "owner": "security reviewer",
+            "action": "Prefer official security-channel package during remediation",
+            "owner": "repository operator",
             "steps": [
-                "Read the upstream advisory or changelog for affected CVEs.",
-                "Prioritize vulnerable fleets that run this OS version.",
-                "Approve rollout only after compatibility checks pass.",
+                "Keep the package eligible for normal mirror promotion.",
+                "Use the security channel as positive source context during vulnerability remediation.",
+                "Continue normal compatibility testing for fleet rollout.",
             ],
         },
         "priority": {
@@ -514,7 +522,7 @@ def validate_package(record: dict[str, Any], repo: Repo | None = None) -> dict[s
         add_check(checks, "transport", "Repository transport", "review", "medium", "repository metadata fetched without HTTPS")
 
     if repo and ("security" in repo_name.lower() or "security" in repo.component.lower()):
-        add_check(checks, "security_channel", "Security channel", "review", "high", "package is published through a security update channel")
+        add_check(checks, "security_channel", "Security channel", "passed", "none", "package is published through an official security update channel")
     elif repo:
         add_check(checks, "security_channel", "Security channel", "passed", "none", f"package is indexed from {repo_family or repo.repo_type} repository metadata")
 
@@ -524,22 +532,10 @@ def validate_package(record: dict[str, Any], repo: Repo | None = None) -> dict[s
         add_check(checks, "priority", "High-impact priority", "review", "high", f"high-impact priority: {priority}")
     name = str(record.get("Package", "")).lower()
     section = record.get("Section", "").lower()
-    high_impact_terms = {
-        "kernel": "kernel or boot path",
-        "auth": "authentication path",
-        "pam": "authentication path",
-        "sudo": "privilege management path",
-        "selinux": "mandatory access control path",
-        "firewall": "network security path",
-        "iptables": "network security path",
-        "nftables": "network security path",
-        "openssl": "cryptography path",
-        "gnutls": "cryptography path",
-        "openssh": "remote access path",
-    }
-    for term, meaning in high_impact_terms.items():
-        if term in name or term in section:
-            add_check(checks, "sensitive_section", "High-impact package area", "review", "medium", f"{meaning}: {section or name}")
+    for pattern, meaning in high_impact_patterns():
+        evidence = high_impact_evidence(pattern, name, section)
+        if evidence:
+            add_check(checks, "sensitive_section", "High-impact package area", "review", "medium", f"{meaning}: {evidence}")
             break
     description = record.get("Description", "")
     if re.search(r"\b(setuid|setgid|privileged daemon|kernel module|loads? kernel modules?|grants? root|runs? as root)\b", description, re.I):
@@ -565,6 +561,36 @@ def validate_package(record: dict[str, Any], repo: Repo | None = None) -> dict[s
         "remediation": remediation,
         "checks": checks,
     }
+
+
+def high_impact_patterns() -> list[tuple[str, str]]:
+    return [
+        ("kernel", "kernel or boot path"),
+        ("linux-image", "kernel or boot path"),
+        ("auth", "authentication path"),
+        ("pam", "authentication path"),
+        ("sudo", "privilege management path"),
+        ("selinux", "mandatory access control path"),
+        ("firewall", "network security path"),
+        ("iptables", "network security path"),
+        ("nftables", "network security path"),
+        ("openssl", "cryptography path"),
+        ("gnutls", "cryptography path"),
+        ("openssh", "remote access path"),
+    ]
+
+
+def high_impact_evidence(term: str, name: str, section: str) -> str:
+    generic_sections = {"", "unspecified", "unknown", "misc", "utils", "admin", "system", "applications/system"}
+    section = (section or "").strip().lower()
+    name = (name or "").strip().lower()
+    token = re.escape(term)
+    token_pattern = rf"(^|[-_/+.\s]){token}($|[-_/+.\s])"
+    if section not in generic_sections and re.search(token_pattern, section):
+        return f"package section contains {term} ({section})"
+    if re.search(token_pattern, name):
+        return f"package name contains {term} ({name})"
+    return ""
 
 
 def package_intelligence(package: dict[str, Any]) -> dict[str, Any]:
@@ -873,19 +899,57 @@ def highest_severity(totals: dict[str, Any]) -> str:
     return "none"
 
 
+def mark_stale_scan_runs(conn: sqlite3.Connection) -> int:
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=SCAN_STALE_MINUTES)
+    stale_ids: list[int] = []
+    for row in conn.execute("SELECT id, started_at FROM scan_runs WHERE status = 'running'"):
+        started = parse_iso(row["started_at"])
+        if started and started < cutoff:
+            stale_ids.append(row["id"])
+    if not stale_ids:
+        return 0
+    placeholders = ",".join("?" for _ in stale_ids)
+    conn.execute(
+        f"""
+        UPDATE scan_runs
+        SET status = 'failed',
+            finished_at = ?,
+            notes = 'Scan run timed out before completion and was marked failed by watchdog.'
+        WHERE id IN ({placeholders})
+        """,
+        [now_iso(), *stale_ids],
+    )
+    return len(stale_ids)
+
+
+def begin_scan_run(conn: sqlite3.Connection, trigger: str, repos_total: int) -> int:
+    conn.execute("BEGIN IMMEDIATE")
+    mark_stale_scan_runs(conn)
+    active = conn.execute(
+        "SELECT id, started_at, trigger FROM scan_runs WHERE status = 'running' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if active:
+        conn.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=f"scan #{active['id']} is already running since {active['started_at']} ({active['trigger']})",
+        )
+    cursor = conn.execute(
+        """
+        INSERT INTO scan_runs(started_at, status, trigger, repos_total, notes)
+        VALUES (?, 'running', ?, ?, ?)
+        """,
+        (now_iso(), trigger, repos_total, "Repository metadata refresh and package security validation started."),
+    )
+    run_id = cursor.lastrowid
+    conn.commit()
+    return int(run_id)
+
+
 async def refresh_all(trigger: str = "manual") -> list[dict[str, Any]]:
     repos = configured_repos()
-    started_at = now_iso()
     with closing(connect_db()) as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO scan_runs(started_at, status, trigger, repos_total, notes)
-            VALUES (?, 'running', ?, ?, ?)
-            """,
-            (started_at, trigger, len(repos), "Repository metadata refresh and package security validation started."),
-        )
-        run_id = cursor.lastrowid
-        conn.commit()
+        run_id = begin_scan_run(conn, trigger, len(repos))
     results = [await refresh_repo(repo) for repo in repos]
     with closing(connect_db()) as conn:
         totals = security_totals(conn)
@@ -959,12 +1023,15 @@ async def api_refresh(request: Request, x_pkgmng_token: str = Header(default="")
 @app.post("/api/scans")
 async def api_scan(request: Request, x_pkgmng_token: str = Header(default="")) -> JSONResponse:
     verify_action_request(request, x_pkgmng_token)
-    return JSONResponse({"results": await refresh_all("manual-scan")})
+    return JSONResponse({"results": await refresh_all("manual")})
 
 
 @app.get("/api/scans")
 def api_scans(limit: int = Query(10, ge=1, le=50)) -> dict[str, Any]:
     with closing(connect_db()) as conn:
+        stale_marked = mark_stale_scan_runs(conn)
+        if stale_marked:
+            conn.commit()
         runs = [
             dict(row)
             for row in conn.execute(
