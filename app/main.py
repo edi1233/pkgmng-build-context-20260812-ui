@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 import time
+import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager, closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -28,13 +29,21 @@ APT_REPOS = os.getenv(
     "debian-bookworm|https://deb.debian.org/debian|bookworm|main,"
     "debian-security|https://security.debian.org/debian-security|bookworm-security|main",
 )
+RPM_REPOS = os.getenv(
+    "RPM_REPOS",
+    "alma-9-baseos|https://repo.almalinux.org/almalinux/9/BaseOS/x86_64/os/|AlmaLinux 9|BaseOS,"
+    "rocky-9-baseos|https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/|Rocky Linux 9|BaseOS,"
+    "oracle-9-baseos|https://yum.oracle.com/repo/OracleLinux/OL9/baseos/latest/x86_64/|Oracle Linux 9|BaseOS,"
+    "redhat-ubi9-baseos|https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/|Red Hat UBI 9|BaseOS",
+)
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))
 MAX_PACKAGES_PER_REPO = int(os.getenv("MAX_PACKAGES_PER_REPO", "2500"))
 
 
 @dataclass(frozen=True)
-class AptRepo:
+class Repo:
     name: str
+    repo_type: str
     base_url: str
     suite: str
     component: str
@@ -45,19 +54,44 @@ class AptRepo:
         rel = f"dists/{self.suite}/{self.component}/binary-amd64/Packages"
         return [f"{base}/{rel}.xz", f"{base}/{rel}.gz", f"{base}/{rel}"]
 
+    @property
+    def repomd_url(self) -> str:
+        return f"{self.base_url.rstrip('/')}/repodata/repomd.xml"
+
+    @property
+    def distro_family(self) -> str:
+        value = f"{self.name} {self.suite} {self.base_url}".lower()
+        if "alma" in value:
+            return "AlmaLinux"
+        if "rocky" in value:
+            return "Rocky Linux"
+        if "oracle" in value or "ol9" in value:
+            return "Oracle Linux"
+        if "redhat" in value or "ubi" in value:
+            return "Red Hat"
+        if self.repo_type == "rpm":
+            return "RHEL family"
+        if "security" in value:
+            return "Debian Security"
+        return "Debian"
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def parse_repos(raw: str = APT_REPOS) -> list[AptRepo]:
-    repos: list[AptRepo] = []
+def parse_repos(raw: str = APT_REPOS, repo_type: str = "apt") -> list[Repo]:
+    repos: list[Repo] = []
     for item in [part.strip() for part in raw.split(",") if part.strip()]:
         parts = [part.strip() for part in item.split("|")]
         if len(parts) != 4:
-            raise ValueError("APT_REPOS entries must use name|base_url|suite|component")
-        repos.append(AptRepo(*parts))
+            raise ValueError(f"{repo_type.upper()} repo entries must use name|base_url|suite|component")
+        repos.append(Repo(parts[0], repo_type, parts[1], parts[2], parts[3]))
     return repos
+
+
+def configured_repos() -> list[Repo]:
+    return [*parse_repos(APT_REPOS, "apt"), *parse_repos(RPM_REPOS, "rpm")]
 
 
 def connect_db() -> sqlite3.Connection:
@@ -74,6 +108,8 @@ def init_db() -> None:
             PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS repos (
               name TEXT PRIMARY KEY,
+              repo_type TEXT NOT NULL DEFAULT 'apt',
+              distro_family TEXT NOT NULL DEFAULT 'Debian',
               base_url TEXT NOT NULL,
               suite TEXT NOT NULL,
               component TEXT NOT NULL,
@@ -95,6 +131,7 @@ def init_db() -> None:
               sha256 TEXT,
               maintainer TEXT,
               description TEXT,
+              package_format TEXT NOT NULL DEFAULT 'deb',
               security_status TEXT NOT NULL,
               security_findings TEXT NOT NULL,
               refreshed_at TEXT NOT NULL,
@@ -104,22 +141,33 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_packages_status ON packages(security_status);
             """
         )
-        for repo in parse_repos():
+        ensure_column(conn, "repos", "repo_type", "TEXT NOT NULL DEFAULT 'apt'")
+        ensure_column(conn, "repos", "distro_family", "TEXT NOT NULL DEFAULT 'Debian'")
+        ensure_column(conn, "packages", "package_format", "TEXT NOT NULL DEFAULT 'deb'")
+        for repo in configured_repos():
             conn.execute(
                 """
-                INSERT INTO repos(name, base_url, suite, component)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO repos(name, repo_type, distro_family, base_url, suite, component)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
+                  repo_type=excluded.repo_type,
+                  distro_family=excluded.distro_family,
                   base_url=excluded.base_url,
                   suite=excluded.suite,
                   component=excluded.component
                 """,
-                (repo.name, repo.base_url, repo.suite, repo.component),
+                (repo.name, repo.repo_type, repo.distro_family, repo.base_url, repo.suite, repo.component),
             )
         conn.commit()
 
 
-def parse_packages_index(text: str) -> list[dict[str, str]]:
+def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def parse_packages_index(text: str) -> list[dict[str, Any]]:
     records: list[dict[str, str]] = []
     current: dict[str, str] = {}
     last_key = ""
@@ -142,29 +190,91 @@ def parse_packages_index(text: str) -> list[dict[str, str]]:
     return records
 
 
-def assess_package(record: dict[str, str]) -> tuple[str, list[str]]:
+def parse_rpm_primary_xml(text: str) -> list[dict[str, Any]]:
+    ns = {
+        "m": "http://linux.duke.edu/metadata/common",
+        "rpm": "http://linux.duke.edu/metadata/rpm",
+    }
+    root = ET.fromstring(text)
+    records: list[dict[str, Any]] = []
+    for package in root.findall("m:package", ns):
+        version = package.find("m:version", ns)
+        checksum = package.find("m:checksum", ns)
+        location = package.find("m:location", ns)
+        size = package.find("m:size", ns)
+        rpm_format = package.find("m:format", ns)
+        license_el = rpm_format.find("rpm:license", ns) if rpm_format is not None else None
+        group_el = rpm_format.find("rpm:group", ns) if rpm_format is not None else None
+        records.append(
+            {
+                "Package": text_of(package, "m:name", ns),
+                "Version": rpm_version(version),
+                "Architecture": text_of(package, "m:arch", ns),
+                "Section": text_of(group_el) or text_of(license_el),
+                "Priority": "",
+                "Filename": location.attrib.get("href", "") if location is not None else "",
+                "Size": size.attrib.get("package", "0") if size is not None else "0",
+                "SHA256": checksum.text.strip() if checksum is not None and checksum.text else "",
+                "Maintainer": text_of(package, "m:packager", ns),
+                "Description": text_of(package, "m:description", ns) or text_of(package, "m:summary", ns),
+                "PackageFormat": "rpm",
+            }
+        )
+    return records
+
+
+def text_of(element: ET.Element | None, path: str | None = None, ns: dict[str, str] | None = None) -> str:
+    target = element.find(path, ns or {}) if element is not None and path else element
+    return target.text.strip() if target is not None and target.text else ""
+
+
+def rpm_version(version: ET.Element | None) -> str:
+    if version is None:
+        return ""
+    epoch = version.attrib.get("epoch", "0")
+    ver = version.attrib.get("ver", "")
+    rel = version.attrib.get("rel", "")
+    prefix = f"{epoch}:" if epoch and epoch != "0" else ""
+    suffix = f"-{rel}" if rel else ""
+    return f"{prefix}{ver}{suffix}"
+
+
+def rpm_primary_href(repomd_xml: str) -> str:
+    ns = {"repo": "http://linux.duke.edu/metadata/repo"}
+    root = ET.fromstring(repomd_xml)
+    for data in root.findall("repo:data", ns):
+        if data.attrib.get("type") == "primary":
+            location = data.find("repo:location", ns)
+            if location is not None and location.attrib.get("href"):
+                return location.attrib["href"]
+    raise RuntimeError("repomd.xml did not include primary metadata")
+
+
+def assess_package(record: dict[str, Any]) -> tuple[str, list[str]]:
     findings: list[str] = []
+    package_format = record.get("PackageFormat", "deb")
     if not record.get("SHA256"):
         findings.append("missing SHA256 checksum")
-    if not record.get("Filename", "").endswith(".deb"):
-        findings.append("package filename is not a .deb")
+    expected_suffix = ".rpm" if package_format == "rpm" else ".deb"
+    if not record.get("Filename", "").endswith(expected_suffix):
+        findings.append(f"package filename is not a {expected_suffix}")
     priority = record.get("Priority", "").lower()
     if priority in {"required", "important"}:
         findings.append(f"high-impact priority: {priority}")
     section = record.get("Section", "").lower()
-    if any(word in section for word in ["admin", "kernel", "net", "utils"]):
+    if any(word in section for word in ["admin", "kernel", "net", "utils", "system", "security"]):
         findings.append(f"sensitive section: {section}")
     description = record.get("Description", "")
     if re.search(r"\b(setuid|root|privilege|kernel module)\b", description, re.I):
         findings.append("description mentions privileged behavior")
     if not findings:
         return "passed", []
-    if any("missing" in item or "not a .deb" in item for item in findings):
+    if any("missing" in item or f"not a {expected_suffix}" in item for item in findings):
         return "failed", findings
     return "review", findings
 
 
-async def fetch_packages_text(repo: AptRepo) -> str:
+async def fetch_packages_text(repo: Repo) -> str:
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS, follow_redirects=True) as client:
         last_error = ""
         for url in repo.packages_urls:
@@ -182,11 +292,34 @@ async def fetch_packages_text(repo: AptRepo) -> str:
         raise RuntimeError(last_error or "no Packages index could be fetched")
 
 
-async def refresh_repo(repo: AptRepo) -> dict[str, Any]:
+async def fetch_rpm_records(repo: Repo) -> list[dict[str, Any]]:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS, follow_redirects=True) as client:
+        repomd_response = await client.get(repo.repomd_url)
+        repomd_response.raise_for_status()
+        primary_url = f"{repo.base_url.rstrip('/')}/{rpm_primary_href(repomd_response.text).lstrip('/')}"
+        primary_response = await client.get(primary_url)
+        primary_response.raise_for_status()
+        data = primary_response.content
+        if primary_url.endswith(".gz"):
+            text = gzip.decompress(data).decode("utf-8", errors="replace")
+        elif primary_url.endswith(".xz"):
+            text = lzma.decompress(data).decode("utf-8", errors="replace")
+        else:
+            text = data.decode("utf-8", errors="replace")
+        return parse_rpm_primary_xml(text)
+
+
+async def repo_records(repo: Repo) -> list[dict[str, Any]]:
+    if repo.repo_type == "rpm":
+        return (await fetch_rpm_records(repo))[:MAX_PACKAGES_PER_REPO]
+    text = await fetch_packages_text(repo)
+    return [{**record, "PackageFormat": "deb"} for record in parse_packages_index(text)[:MAX_PACKAGES_PER_REPO]]
+
+
+async def refresh_repo(repo: Repo) -> dict[str, Any]:
     started = time.time()
     try:
-        text = await fetch_packages_text(repo)
-        records = parse_packages_index(text)[:MAX_PACKAGES_PER_REPO]
+        records = await repo_records(repo)
         refreshed_at = now_iso()
         with closing(connect_db()) as conn:
             conn.execute("DELETE FROM packages WHERE repo_name = ?", (repo.name,))
@@ -197,8 +330,8 @@ async def refresh_repo(repo: AptRepo) -> dict[str, Any]:
                     INSERT OR REPLACE INTO packages (
                       repo_name, package, version, architecture, section, priority,
                       filename, size, sha256, maintainer, description,
-                      security_status, security_findings, refreshed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      package_format, security_status, security_findings, refreshed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         repo.name,
@@ -212,6 +345,7 @@ async def refresh_repo(repo: AptRepo) -> dict[str, Any]:
                         record.get("SHA256", ""),
                         record.get("Maintainer", ""),
                         record.get("Description", ""),
+                        record.get("PackageFormat", repo.repo_type),
                         status,
                         json.dumps(findings),
                         refreshed_at,
@@ -238,7 +372,7 @@ async def refresh_repo(repo: AptRepo) -> dict[str, Any]:
 
 
 async def refresh_all() -> list[dict[str, Any]]:
-    return [await refresh_repo(repo) for repo in parse_repos()]
+    return [await refresh_repo(repo) for repo in configured_repos()]
 
 
 def schedule_refresh() -> BackgroundScheduler:
@@ -281,13 +415,36 @@ async def api_refresh() -> JSONResponse:
 @app.get("/api/repos")
 def api_repos() -> list[dict[str, Any]]:
     with closing(connect_db()) as conn:
-        return [dict(row) for row in conn.execute("SELECT * FROM repos ORDER BY name")]
+        return [dict(row) for row in conn.execute("SELECT * FROM repos ORDER BY repo_type, distro_family, name")]
+
+
+@app.get("/api/families")
+def api_families() -> list[dict[str, Any]]:
+    with closing(connect_db()) as conn:
+        return [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT
+                  distro_family,
+                  repo_type,
+                  COUNT(*) repos,
+                  SUM(package_count) packages,
+                  SUM(status='ok') healthy,
+                  SUM(status='error') errors
+                FROM repos
+                GROUP BY distro_family, repo_type
+                ORDER BY repo_type, distro_family
+                """
+            )
+        ]
 
 
 @app.get("/api/packages")
 def api_packages(
     q: str = "",
     status: str = Query("", pattern="^(|passed|review|failed)$"),
+    family: str = "",
     limit: int = Query(200, ge=1, le=1000),
 ) -> dict[str, Any]:
     where: list[str] = []
@@ -298,7 +455,14 @@ def api_packages(
     if status:
         where.append("security_status = ?")
         args.append(status)
-    sql = "SELECT * FROM packages"
+    if family:
+        where.append("repos.distro_family = ?")
+        args.append(family)
+    sql = """
+        SELECT packages.*, repos.distro_family
+        FROM packages
+        JOIN repos ON repos.name = packages.repo_name
+    """
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY security_status DESC, package LIMIT ?"
@@ -328,10 +492,10 @@ def dashboard_html() -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="APT repository index with package metadata and security review status.">
-  <title>pkgmng | APT package control</title>
+  <meta name="description" content="APT and RPM repository index with package metadata and security review status.">
+  <title>pkgmng | Linux package control</title>
   <style>
-    :root { color-scheme: light; --ink:#101418; --muted:#66727f; --line:#d7dde5; --accent:#0a6f64; --accent-2:#d7f36a; --bad:#a9342c; --warn:#8a641a; --ok:#087443; --shadow:0 22px 70px rgba(32,45,58,.12); --ease:cubic-bezier(.32,.72,0,1); }
+    :root { color-scheme: light; --ink:#101418; --muted:#66727f; --line:#d7dde5; --accent:#0a6f64; --accent-2:#d7f36a; --bad:#a9342c; --warn:#8a641a; --ok:#087443; --rh:#c52032; --oracle:#c74634; --rocky:#10b981; --alma:#2563eb; --shadow:0 22px 70px rgba(32,45,58,.12); --ease:cubic-bezier(.32,.72,0,1); }
     * { box-sizing: border-box; }
     html { scroll-behavior: smooth; }
     body { margin: 0; font-family: "Aptos", "Segoe UI Variable", ui-sans-serif, system-ui, sans-serif; background: radial-gradient(circle at 82% -10%, rgba(215,243,106,.38), transparent 26rem), radial-gradient(circle at 4% 8%, rgba(10,111,100,.14), transparent 24rem), linear-gradient(145deg, #f8faf8 0%, #eef3f1 46%, #f9faf7 100%); color: var(--ink); min-height: 100dvh; }
@@ -366,7 +530,7 @@ def dashboard_html() -> str:
     .section-head { display:flex; align-items:end; justify-content:space-between; gap:18px; margin:24px 0 16px; }
     h2 { margin:0; font-size:clamp(24px,3vw,42px); line-height:1; letter-spacing:0; }
     .muted { color: var(--muted); }
-    .toolbar { display:grid; grid-template-columns:minmax(220px,1fr) 170px; gap:12px; align-items:center; margin:16px 0; }
+    .toolbar { display:grid; grid-template-columns:minmax(240px,1fr) 170px 210px; gap:12px; align-items:center; margin:16px 0; }
     input, select { width:100%; padding:0 14px; }
     .metrics { display:grid; grid-template-columns:repeat(4,minmax(140px,1fr)); gap:12px; }
     .metric { border-radius:24px; padding:7px; background:rgba(16,20,24,.055); animation:rise .8s var(--ease) both; }
@@ -378,6 +542,17 @@ def dashboard_html() -> str:
     .repo-core { min-height:154px; border-radius:18px; background:rgba(255,255,255,.86); padding:18px; box-shadow:inset 0 1px 0 rgba(255,255,255,.9); }
     .repo h3 { display:flex; align-items:center; justify-content:space-between; gap:10px; margin:0 0 14px; font-size:16px; }
     .repo p { margin:8px 0 0; color:var(--muted); font-size:13px; line-height:1.45; overflow-wrap:anywhere; }
+    .families { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:12px; margin:0 0 34px; }
+    .family { border-radius:22px; padding:16px; background:rgba(255,255,255,.82); border:1px solid rgba(16,20,24,.08); box-shadow:inset 0 1px 0 rgba(255,255,255,.9); }
+    .family h3 { display:flex; align-items:center; gap:9px; margin:0 0 10px; font-size:15px; }
+    .family-dot { width:10px; height:10px; border-radius:999px; background:var(--accent); }
+    .family[data-family*="Alma"] .family-dot { background:var(--alma); }
+    .family[data-family*="Rocky"] .family-dot { background:var(--rocky); }
+    .family[data-family*="Oracle"] .family-dot { background:var(--oracle); }
+    .family[data-family*="Red"] .family-dot { background:var(--rh); }
+    .family dl { display:grid; grid-template-columns:1fr 1fr; gap:8px 12px; margin:0; }
+    .family dt { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.11em; }
+    .family dd { margin:2px 0 0; font-size:22px; font-weight:760; font-variant-numeric:tabular-nums; }
     .badge { display:inline-flex; align-items:center; border-radius:999px; padding:5px 10px; font-size:12px; font-weight:720; text-transform:uppercase; letter-spacing:.08em; }
     .passed { color:#063f27; background:rgba(8,116,67,.13); }
     .review { color:#62440a; background:rgba(138,100,26,.16); }
@@ -423,11 +598,11 @@ def dashboard_html() -> str:
       <section>
         <div class="brandbar">
           <div class="mark"><span class="mark-dot" aria-hidden="true"></span><span>pkgmng</span></div>
-          <span class="eyebrow">APT control plane</span>
+          <span class="eyebrow">APT + RHEL-family RPM control plane</span>
         </div>
         <div class="eyebrow">Repository mirror index</div>
-        <h1>Package intelligence for Debian fleets.</h1>
-        <p class="lede">Track repository freshness, package metadata, and security review signals from one production console.</p>
+        <h1>Package intelligence for Linux fleets.</h1>
+        <p class="lede">Track Debian APT plus AlmaLinux, Rocky Linux, Oracle Linux, and Red Hat RPM repositories with security review signals from one production console.</p>
         <div class="hero-actions">
           <button id="refresh">Refresh index <span class="button-orb" aria-hidden="true">+</span></button>
           <button class="ghost" id="show-review">Review queue <span class="button-orb" aria-hidden="true">&gt;</span></button>
@@ -446,10 +621,18 @@ def dashboard_html() -> str:
       <section class="metrics" id="metrics" aria-label="Package security totals"></section>
       <div class="section-head">
         <div>
+          <div class="eyebrow">RHEL-family coverage</div>
+          <h2>Distribution lanes</h2>
+        </div>
+        <p class="muted">RPM metadata from AlmaLinux, Rocky Linux, Oracle Linux, and Red Hat UBI sources is indexed alongside Debian APT data.</p>
+      </div>
+      <section class="families" id="families" aria-label="Distribution family summary"></section>
+      <div class="section-head">
+        <div>
           <div class="eyebrow">Repository sources</div>
           <h2>Mirror health</h2>
         </div>
-        <p class="muted">Status, package counts, and last refresh time for each configured APT source.</p>
+        <p class="muted">Status, package counts, and last refresh time for each configured APT or RPM source.</p>
       </div>
       <section class="repos" id="repos"></section>
       <div class="section-head">
@@ -466,11 +649,14 @@ def dashboard_html() -> str:
           <option value="review">Review</option>
           <option value="passed">Passed</option>
         </select>
+        <select id="family" aria-label="Filter by distribution family">
+          <option value="">All families</option>
+        </select>
       </div>
       <section class="table-shell" id="packages-table">
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Package</th><th>Version</th><th>Repo</th><th>Status</th><th>Section</th><th>Findings</th><th>Description</th></tr></thead>
+            <thead><tr><th>Package</th><th>Version</th><th>Repo</th><th>Format</th><th>Status</th><th>Section</th><th>Findings</th><th>Description</th></tr></thead>
             <tbody id="packages"></tbody>
           </table>
         </div>
@@ -478,20 +664,20 @@ def dashboard_html() -> str:
     </main>
     <footer>
       <span>pkgmng production console</span>
-      <span>Security heuristics are advisory and package metadata driven.</span>
+      <span>Security heuristics are advisory and metadata driven across DEB and RPM packages.</span>
     </footer>
   </div>
   <script>
     const $ = (id) => document.getElementById(id);
     const esc = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-    const skeletonRows = () => Array.from({length: 8}).map(() => '<tr><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td></tr>').join('');
+    const skeletonRows = () => Array.from({length: 8}).map(() => '<tr><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td></tr>').join('');
     const statusClass = (value) => ['passed', 'review', 'failed', 'pending'].includes(value) ? value : 'pending';
     const n = (value) => Number(value || 0).toLocaleString();
     async function load() {
       $('packages').innerHTML = skeletonRows();
       try {
-        const params = new URLSearchParams({ q: $('q').value, status: $('status').value, limit: '300' });
-        const [repos, packages] = await Promise.all([fetch('/api/repos').then(r => r.json()), fetch('/api/packages?' + params).then(r => r.json())]);
+        const params = new URLSearchParams({ q: $('q').value, status: $('status').value, family: $('family').value, limit: '300' });
+        const [repos, families, packages] = await Promise.all([fetch('/api/repos').then(r => r.json()), fetch('/api/families').then(r => r.json()), fetch('/api/packages?' + params).then(r => r.json())]);
         const totals = packages.totals || {};
         $('hero-summary').innerHTML = [
           ['Indexed packages', n(totals.total)],
@@ -500,8 +686,12 @@ def dashboard_html() -> str:
           ['Refresh cadence', '6h']
         ].map(([k,v]) => `<div class="scanline"><span>${k}</span><strong>${v}</strong></div>`).join('');
         $('metrics').innerHTML = [['Total', totals.total], ['Passed', totals.passed], ['Review', totals.review], ['Failed', totals.failed]].map(([k,v], i) => `<article class="metric" style="animation-delay:${i * 60}ms"><div class="metric-inner"><strong>${n(v)}</strong><span>${k}</span></div></article>`).join('');
-        $('repos').innerHTML = repos.length ? repos.map((r, i) => `<article class="repo" style="animation-delay:${i * 70}ms"><div class="repo-core"><h3>${esc(r.name)} <span class="badge ${r.status === 'ok' ? 'passed' : 'failed'}">${esc(r.status)}</span></h3><p>${esc(r.base_url)}</p><p>${esc(r.suite)}/${esc(r.component)} - ${n(r.package_count)} packages</p><p>Refreshed ${esc(r.last_refresh || 'never')}</p>${r.error ? `<p class="error">${esc(r.error)}</p>` : ''}</div></article>`).join('') : '<article class="repo"><div class="repo-core"><h3>No repositories configured</h3><p>Add APT_REPOS entries to begin indexing.</p></div></article>';
-        $('packages').innerHTML = packages.packages.length ? packages.packages.map(p => `<tr><td>${esc(p.package)}</td><td>${esc(p.version)}</td><td>${esc(p.repo_name)}</td><td><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span></td><td>${esc(p.section || '')}</td><td>${esc((p.security_findings || []).join('; ') || 'none')}</td><td class="muted">${esc((p.description || '').split('\\n')[0])}</td></tr>`).join('') : '<tr><td colspan="3"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></td><td colspan="4"></td></tr>';
+        const familyValue = $('family').value;
+        $('family').innerHTML = '<option value="">All families</option>' + families.map(f => `<option value="${esc(f.distro_family)}">${esc(f.distro_family)}</option>`).join('');
+        $('family').value = familyValue;
+        $('families').innerHTML = families.length ? families.map(f => `<article class="family" data-family="${esc(f.distro_family)}"><h3><span class="family-dot"></span>${esc(f.distro_family)}</h3><dl><div><dt>Repos</dt><dd>${n(f.repos)}</dd></div><div><dt>Packages</dt><dd>${n(f.packages)}</dd></div><div><dt>Healthy</dt><dd>${n(f.healthy)}</dd></div><div><dt>Errors</dt><dd>${n(f.errors)}</dd></div></dl></article>`).join('') : '<article class="family"><h3><span class="family-dot"></span>No family data</h3></article>';
+        $('repos').innerHTML = repos.length ? repos.map((r, i) => `<article class="repo" style="animation-delay:${i * 70}ms"><div class="repo-core"><h3>${esc(r.name)} <span class="badge ${r.status === 'ok' ? 'passed' : 'failed'}">${esc(r.status)}</span></h3><p><span class="badge pending">${esc(r.distro_family || (r.repo_type || 'apt').toUpperCase())}</span> <span class="badge pending">${esc((r.repo_type || 'apt').toUpperCase())}</span></p><p>${esc(r.base_url)}</p><p>${esc(r.suite)}/${esc(r.component)} - ${n(r.package_count)} packages</p><p>Refreshed ${esc(r.last_refresh || 'never')}</p>${r.error ? `<p class="error">${esc(r.error)}</p>` : ''}</div></article>`).join('') : '<article class="repo"><div class="repo-core"><h3>No repositories configured</h3><p>Add APT_REPOS or RPM_REPOS entries to begin indexing.</p></div></article>';
+        $('packages').innerHTML = packages.packages.length ? packages.packages.map(p => `<tr><td>${esc(p.package)}</td><td>${esc(p.version)}</td><td>${esc(p.repo_name)}</td><td>${esc((p.package_format || 'deb').toUpperCase())}</td><td><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span></td><td>${esc(p.section || '')}</td><td>${esc((p.security_findings || []).join('; ') || 'none')}</td><td class="muted">${esc((p.description || '').split('\\n')[0])}</td></tr>`).join('') : '<tr><td colspan="4"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></td><td colspan="4"></td></tr>';
       } catch (error) {
         $('packages').innerHTML = `<tr><td colspan="7"><div class="state error"><strong>Could not load package data</strong>${esc(error.message || error)}</div></td></tr>`;
       }
@@ -510,6 +700,7 @@ def dashboard_html() -> str:
     $('show-review').addEventListener('click', () => { $('status').value = 'review'; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
     $('q').addEventListener('input', () => clearTimeout(window.__t) || (window.__t = setTimeout(load, 250)));
     $('status').addEventListener('change', load);
+    $('family').addEventListener('change', load);
     load();
   </script>
 </body>
