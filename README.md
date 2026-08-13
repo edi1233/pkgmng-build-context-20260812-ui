@@ -44,6 +44,18 @@ alma-10-baseos|https://repo.almalinux.org/almalinux/10/BaseOS/x86_64/os/|AlmaLin
 
 The UI exposes a distribution-family summary, version lanes, and package filters by Debian, AlmaLinux, Rocky Linux, Oracle Linux, Red Hat, and OS version.
 
+For Kubernetes operation, repository-source management, OS-level client setup, and exposure choices, see [docs/operations.md](docs/operations.md).
+
+Repository sources are first-class platform records:
+
+- `GET /api/repos` lists configured APT and RPM sources with mirror health and package counts.
+- `POST /api/repos` adds a new source using `name`, `repo_type`, `base_url`, `suite`, and `component`.
+- `PUT /api/repos/{name}` edits an existing source.
+- `GET /api/repos/{name}/packages` lists only the DEB/RPM package records indexed from that source.
+- `GET /api/packages?repo=<name>` applies the same source filter in the general package table API.
+
+Sources added through the API are stored in SQLite and survive app restarts. Default environment-configured sources are upserted on startup, but custom operator-added sources are not deleted when they are absent from `APT_REPOS` or `RPM_REPOS`.
+
 ## Security validation
 
 Every indexed DEB and RPM package receives a structured validation profile:
@@ -61,6 +73,22 @@ Sensitive package review is intentionally weighted toward high-impact areas such
 Official security update channels are treated as positive source context, not as a risk finding. Packages only enter review when the scanner has concrete evidence such as a high-impact package name/section, priority, privileged behavior wording, advisory wording, or incomplete artifact metadata.
 
 The `/api/security` endpoint returns global totals, OS/version breakdowns, and the highest-risk package records. The dashboard renders the same data in the "All package checks" panel and the package inventory table.
+
+### Status and severity meaning
+
+| Field | Meaning |
+|---|---|
+| `security_status=passed` | Package passed current metadata and safety checks. No operator action is required. |
+| `security_status=review` | Package has a concrete signal that needs a human decision before promotion into trusted mirrors. |
+| `security_status=failed` | Package has a blocking validation issue and should be quarantined or blocked until resolved. |
+| `security_severity=none` | No active finding. |
+| `security_severity=medium` | Review during normal intake. |
+| `security_severity=high` | Prioritize review before promotion. |
+| `security_severity=critical` | Treat as blocking until fixed or formally waived. |
+
+Operators should start with `failed` packages, then `review` packages sorted by severity/risk score. Open package detail to inspect `why_not_safe`, package purpose, architecture, checksum algorithm, source repository, and remediation steps. Official security update channels are positive or neutral source context, not a risk finding by themselves.
+
+For the full status glossary and operating procedure, see [Package Security Statuses](docs/operations.md#package-security-statuses).
 
 ## Scan and remediation workflow
 

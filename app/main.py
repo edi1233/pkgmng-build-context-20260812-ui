@@ -1621,10 +1621,16 @@ def dashboard_html() -> str:
     td .truncate { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:100%; }
     .insight-cell { display:grid; gap:6px; min-width:0; max-width:100%; }
     .insight-text { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; color:var(--ink); line-height:1.35; }
-    .insight-text.expanded { display:block; max-height:none; overflow:visible; }
+    .insight-cell[data-expanded="true"] .insight-text { display:block; -webkit-line-clamp:unset; max-height:none; overflow:visible; white-space:normal; }
+    .insight-actions { display:flex; align-items:center; flex-wrap:wrap; gap:8px; }
     .insight-toggle { all:unset; width:max-content; cursor:pointer; color:var(--primary-strong); font-size:12px; font-weight:760; line-height:1.2; }
     .insight-toggle:hover { text-decoration:underline; }
     .insight-toggle:focus-visible { outline:3px solid color-mix(in srgb, var(--primary) 28%, transparent); outline-offset:3px; border-radius:8px; }
+    .insight-reader { display:none; margin:12px 0; padding:16px; border-radius:16px; background:var(--surface); border:1px solid color-mix(in srgb, var(--primary) 18%, var(--line)); box-shadow:var(--shadow-soft); }
+    .insight-reader[data-open="true"] { display:block; }
+    .insight-reader-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:10px; }
+    .insight-reader h3 { margin:0; font-size:18px; }
+    .insight-reader p { margin:0; line-height:1.55; color:var(--ink); white-space:pre-wrap; overflow-wrap:anywhere; }
     td:nth-child(1) { width:14%; font-weight:750; }
     td:nth-child(2) { width:17%; overflow-wrap:anywhere; font-variant-numeric:tabular-nums; }
     td:nth-child(3) { width:11%; }
@@ -1852,6 +1858,13 @@ def dashboard_html() -> str:
             <button class="ghost" id="next-page">Next <span class="button-orb" aria-hidden="true"><svg><use href="#icon-chevron-right"></use></svg></span></button>
           </div>
         </div>
+        <aside class="insight-reader" id="insight-reader" data-open="false" aria-live="polite">
+          <div class="insight-reader-head">
+            <h3 id="insight-reader-title">Full package insight</h3>
+            <button class="ghost mini-button" id="close-insight-reader" type="button">Close</button>
+          </div>
+          <p id="insight-reader-body"></p>
+        </aside>
         <div class="table-wrap">
           <table>
             <thead><tr><th>Package</th><th>Version</th><th>Repo</th><th>Arch</th><th>Responsible for</th><th>Format</th><th>Status</th><th>Severity</th><th>Risk</th><th>Why unsafe</th><th>Purpose</th></tr></thead>
@@ -1885,7 +1898,10 @@ def dashboard_html() -> str:
     const insightCell = (text, label) => {
       const value = String(text || 'none');
       const needsToggle = value.length > 92;
-      return `<div class="insight-cell" data-expanded="false"><span class="insight-text" title="${esc(value)}">${esc(value)}</span>${needsToggle ? `<button class="insight-toggle" type="button" aria-expanded="false" aria-label="Show full ${esc(label)}">Show more</button>` : ''}</div>`;
+      const readerButton = value && value !== 'none'
+        ? `<button class="insight-toggle insight-reader-open" type="button" data-insight-label="${esc(label)}" data-insight-text="${esc(value)}" aria-label="Open full ${esc(label)}">Open full text</button>`
+        : '';
+      return `<div class="insight-cell" data-expanded="false"><span class="insight-text" title="${esc(value)}">${esc(value)}</span><div class="insight-actions">${needsToggle ? `<button class="insight-toggle insight-expand" type="button" aria-expanded="false" aria-label="Expand ${esc(label)} preview">Show more</button>` : ''}${readerButton}</div></div>`;
     };
     const filterIds = ['q', 'status', 'severity', 'family', 'version', 'repo-filter', 'format', 'architecture', 'checksum', 'sort'];
     const selectedFilters = () => ({
@@ -1985,13 +2001,18 @@ def dashboard_html() -> str:
         $('packages').innerHTML = packages.packages.length ? packages.packages.map(p => `<tr><td><button class="details-button truncate" title="${esc(p.package)}" data-package-id="${esc(p.id)}">${esc(p.package)}</button></td><td><span class="truncate" title="${esc(p.version)}">${esc(p.version)}</span></td><td><span class="truncate" title="${esc(p.repo_name)}">${esc(p.repo_name)}</span><span class="muted truncate">${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</span></td><td>${esc(p.architecture || 'n/a')}</td><td><span class="truncate" title="${esc(p.category)}">${esc(p.category)}</span><span class="muted truncate" title="${esc(p.responsibility)}">${esc(p.responsibility)}</span></td><td>${esc((p.package_format || 'deb').toUpperCase())}<br><span class="muted">${esc((p.checksum_algorithm || '').toUpperCase())}</span></td><td><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span></td><td><span class="badge ${esc(p.security_severity || 'none')}">${esc(p.security_severity || 'none')}</span></td><td>${n(p.security_risk_score)}</td><td>${insightCell(p.why_not_safe || 'none', 'unsafe reason')}</td><td class="muted">${insightCell(p.primary_purpose || (p.description || '').split('\\n')[0], 'package purpose')}</td></tr>`).join('') : '<tr><td colspan="7"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></td><td colspan="4"></td></tr>';
         $('package-cards').innerHTML = packages.packages.length ? packages.packages.map(p => `<article class="package-card"><h3><button class="details-button" data-package-id="${esc(p.id)}">${esc(p.package)}</button></h3><div class="package-meta"><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span><span class="badge ${esc(p.security_severity || 'none')}">${esc(p.security_severity || 'none')}</span><span class="badge pending">${esc(p.architecture || 'n/a')}</span><span class="badge pending">${esc((p.package_format || 'deb').toUpperCase())}</span></div><dl><div><dt>Version</dt><dd>${esc(p.version)}</dd></div><div><dt>Repo</dt><dd>${esc(p.repo_name)} · ${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</dd></div><div><dt>Responsible for</dt><dd>${esc(p.responsibility)}</dd></div><div><dt>Why unsafe</dt><dd>${insightCell(p.why_not_safe || 'none', 'unsafe reason')}</dd></div><div><dt>Purpose</dt><dd>${insightCell(p.primary_purpose || (p.description || '').split('\\n')[0], 'package purpose')}</dd></div></dl></article>`).join('') : '<article class="package-card"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></article>';
         document.querySelectorAll('.details-button').forEach(button => button.addEventListener('click', () => showPackage(button.dataset.packageId)));
-        document.querySelectorAll('.insight-toggle').forEach(button => button.addEventListener('click', () => {
+        document.querySelectorAll('.insight-expand').forEach(button => button.addEventListener('click', () => {
           const cell = button.closest('.insight-cell');
           const expanded = cell.dataset.expanded === 'true';
           cell.dataset.expanded = expanded ? 'false' : 'true';
-          cell.querySelector('.insight-text').classList.toggle('expanded', !expanded);
           button.textContent = expanded ? 'Show more' : 'Show less';
           button.setAttribute('aria-expanded', String(!expanded));
+        }));
+        document.querySelectorAll('.insight-reader-open').forEach(button => button.addEventListener('click', () => {
+          $('insight-reader-title').textContent = button.dataset.insightLabel === 'unsafe reason' ? 'Full Why unsafe reason' : 'Full package purpose';
+          $('insight-reader-body').textContent = button.dataset.insightText || 'No detail available.';
+          $('insight-reader').dataset.open = 'true';
+          $('insight-reader').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
         }));
       } catch (error) {
         $('packages').innerHTML = `<tr><td colspan="11"><div class="state error"><strong>Could not load package data</strong>${esc(error.message || error)}</div></td></tr>`;
@@ -2088,6 +2109,10 @@ def dashboard_html() -> str:
     $('source-form').addEventListener('submit', saveSource);
     $('new-source').addEventListener('click', resetSourceForm);
     $('theme-toggle').addEventListener('click', () => setTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'));
+    $('close-insight-reader').addEventListener('click', () => {
+      $('insight-reader').dataset.open = 'false';
+      $('insight-reader-body').textContent = '';
+    });
     setTheme(localStorage.getItem('pkgmng-theme') || 'light');
     load();
   </script>

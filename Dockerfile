@@ -1,8 +1,27 @@
-FROM harbor.edi-it.com/airuneers/pkgmng:20260813-sources-c9f4888
+FROM python:3.12-slim
 
-COPY app/main.py /app/app/main.py
-COPY app/inventory_controls.py /app/app/inventory_controls.py
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    APP_HOST=0.0.0.0 \
+    APP_PORT=8080 \
+    DATA_DIR=/data
 
-ENV APP_VERSION=20260813-expandtext-main
+WORKDIR /app
 
-CMD ["python", "-m", "app.inventory_controls"]
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app ./app
+
+RUN useradd -r -u 10001 -g root pkgmng \
+    && mkdir -p /data \
+    && chown -R pkgmng:root /data /app
+
+USER pkgmng
+EXPOSE 8080
+
+CMD ["python", "-m", "app.main"]
