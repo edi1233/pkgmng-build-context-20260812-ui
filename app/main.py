@@ -134,6 +134,82 @@ def configured_repos() -> list[Repo]:
     return [*parse_repos(APT_REPOS, "apt"), *parse_repos(RPM_REPOS, "rpm")]
 
 
+def repo_from_row(row: sqlite3.Row | dict[str, Any]) -> Repo:
+    return Repo(
+        str(row["name"]),
+        str(row["repo_type"]),
+        str(row["base_url"]),
+        str(row["suite"]),
+        str(row["component"]),
+    )
+
+
+def stored_repos() -> list[Repo]:
+    with closing(connect_db()) as conn:
+        return [
+            repo_from_row(row)
+            for row in conn.execute(
+                "SELECT name, repo_type, base_url, suite, component FROM repos ORDER BY repo_type, distro_family, name"
+            )
+        ]
+
+
+def repo_payload(payload: dict[str, Any], existing_name: str = "") -> Repo:
+    name = str(payload.get("name") or existing_name).strip()
+    repo_type = str(payload.get("repo_type") or "").strip().lower()
+    base_url = str(payload.get("base_url") or "").strip()
+    suite = str(payload.get("suite") or "").strip()
+    component = str(payload.get("component") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{1,80}", name):
+        raise HTTPException(status_code=400, detail="repo name must be 2-81 characters using letters, numbers, dot, underscore, or dash")
+    if repo_type not in {"apt", "rpm"}:
+        raise HTTPException(status_code=400, detail="repo_type must be apt or rpm")
+    if not base_url.startswith(("https://", "http://")):
+        raise HTTPException(status_code=400, detail="base_url must start with http:// or https://")
+    if not suite or not component:
+        raise HTTPException(status_code=400, detail="suite and component are required")
+    return Repo(name=name, repo_type=repo_type, base_url=base_url, suite=suite, component=component)
+
+
+def upsert_repo_source(conn: sqlite3.Connection, repo: Repo, reset_status: bool = False) -> None:
+    conn.execute(
+        """
+        INSERT INTO repos(name, repo_type, distro_family, release_version, base_url, suite, component, status, error)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL)
+        ON CONFLICT(name) DO UPDATE SET
+          repo_type=excluded.repo_type,
+          distro_family=excluded.distro_family,
+          release_version=excluded.release_version,
+          base_url=excluded.base_url,
+          suite=excluded.suite,
+          component=excluded.component,
+          status=CASE
+            WHEN ? OR repos.repo_type != excluded.repo_type OR repos.base_url != excluded.base_url
+                 OR repos.suite != excluded.suite OR repos.component != excluded.component
+            THEN 'pending'
+            ELSE repos.status
+          END,
+          error=CASE
+            WHEN ? OR repos.repo_type != excluded.repo_type OR repos.base_url != excluded.base_url
+                 OR repos.suite != excluded.suite OR repos.component != excluded.component
+            THEN NULL
+            ELSE repos.error
+          END
+        """,
+        (
+            repo.name,
+            repo.repo_type,
+            repo.distro_family,
+            repo.release_version,
+            repo.base_url,
+            repo.suite,
+            repo.component,
+            reset_status,
+            reset_status,
+        ),
+    )
+
+
 def connect_db() -> sqlite3.Connection:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -211,35 +287,8 @@ def init_db() -> None:
         ensure_column(conn, "packages", "security_severity", "TEXT NOT NULL DEFAULT 'none'")
         ensure_column(conn, "packages", "security_risk_score", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "packages", "security_checks", "TEXT NOT NULL DEFAULT '[]'")
-        repos = configured_repos()
-        repo_names = [repo.name for repo in repos]
-        if repo_names:
-            placeholders = ",".join("?" for _ in repo_names)
-            conn.execute(f"DELETE FROM packages WHERE repo_name NOT IN ({placeholders})", repo_names)
-            conn.execute(f"DELETE FROM repos WHERE name NOT IN ({placeholders})", repo_names)
-        for repo in repos:
-            conn.execute(
-                """
-                INSERT INTO repos(name, repo_type, distro_family, release_version, base_url, suite, component)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(name) DO UPDATE SET
-                  repo_type=excluded.repo_type,
-                  distro_family=excluded.distro_family,
-                  release_version=excluded.release_version,
-                  base_url=excluded.base_url,
-                  suite=excluded.suite,
-                  component=excluded.component
-                """,
-                (
-                    repo.name,
-                    repo.repo_type,
-                    repo.distro_family,
-                    repo.release_version,
-                    repo.base_url,
-                    repo.suite,
-                    repo.component,
-                ),
-            )
+        for repo in configured_repos():
+            upsert_repo_source(conn, repo, reset_status=False)
         conn.commit()
 
 
@@ -947,7 +996,7 @@ def begin_scan_run(conn: sqlite3.Connection, trigger: str, repos_total: int) -> 
 
 
 async def refresh_all(trigger: str = "manual") -> list[dict[str, Any]]:
-    repos = configured_repos()
+    repos = stored_repos()
     with closing(connect_db()) as conn:
         run_id = begin_scan_run(conn, trigger, len(repos))
     results = [await refresh_repo(repo) for repo in repos]
@@ -1052,6 +1101,69 @@ def api_scans(limit: int = Query(10, ge=1, le=50)) -> dict[str, Any]:
 def api_repos() -> list[dict[str, Any]]:
     with closing(connect_db()) as conn:
         return [dict(row) for row in conn.execute("SELECT * FROM repos ORDER BY repo_type, distro_family, name")]
+
+
+@app.post("/api/repos")
+async def api_create_repo(request: Request, x_pkgmng_token: str = Header(default="")) -> JSONResponse:
+    verify_action_request(request, x_pkgmng_token)
+    repo = repo_payload(await request.json())
+    with closing(connect_db()) as conn:
+        existing = conn.execute("SELECT name FROM repos WHERE name = ?", (repo.name,)).fetchone()
+        if existing:
+            raise HTTPException(status_code=409, detail=f"repo {repo.name} already exists")
+        upsert_repo_source(conn, repo, reset_status=True)
+        conn.commit()
+    return JSONResponse({"repo": repo_response(repo), "message": "repository source added"}, status_code=201)
+
+
+@app.put("/api/repos/{repo_name}")
+async def api_update_repo(repo_name: str, request: Request, x_pkgmng_token: str = Header(default="")) -> JSONResponse:
+    verify_action_request(request, x_pkgmng_token)
+    repo = repo_payload({**await request.json(), "name": repo_name}, existing_name=repo_name)
+    with closing(connect_db()) as conn:
+        existing = conn.execute("SELECT name FROM repos WHERE name = ?", (repo_name,)).fetchone()
+        if existing is None:
+            raise HTTPException(status_code=404, detail="repo not found")
+        upsert_repo_source(conn, repo, reset_status=True)
+        if repo.name != repo_name:
+            conn.execute("UPDATE packages SET repo_name = ? WHERE repo_name = ?", (repo.name, repo_name))
+            conn.execute("DELETE FROM repos WHERE name = ?", (repo_name,))
+        conn.commit()
+    return JSONResponse({"repo": repo_response(repo), "message": "repository source updated"})
+
+
+def repo_response(repo: Repo) -> dict[str, Any]:
+    return {
+        "name": repo.name,
+        "repo_type": repo.repo_type,
+        "base_url": repo.base_url,
+        "suite": repo.suite,
+        "component": repo.component,
+        "distro_family": repo.distro_family,
+        "release_version": repo.release_version,
+    }
+
+
+@app.get("/api/repos/{repo_name}/packages")
+def api_repo_packages(
+    repo_name: str,
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    return api_packages(
+        q="",
+        status="",
+        severity="",
+        family="",
+        version="",
+        repo=repo_name,
+        package_format="",
+        architecture="",
+        checksum_algorithm="",
+        sort="risk",
+        limit=limit,
+        offset=offset,
+    )
 
 
 @app.get("/api/families")
@@ -1210,8 +1322,14 @@ def latest_versions(rows: list[dict[str, Any]], limit: int = 5) -> list[dict[str
 def api_packages(
     q: str = "",
     status: str = Query("", pattern="^(|passed|review|failed)$"),
+    severity: str = Query("", pattern="^(|none|low|medium|high|critical)$"),
     family: str = "",
     version: str = "",
+    repo: str = "",
+    package_format: str = Query("", pattern="^(|deb|rpm)$"),
+    architecture: str = "",
+    checksum_algorithm: str = "",
+    sort: str = Query("risk", pattern="^(risk|package|repo|version|status|severity|updated)$"),
     limit: int = Query(200, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
@@ -1223,12 +1341,27 @@ def api_packages(
     if status:
         where.append("security_status = ?")
         args.append(status)
+    if severity:
+        where.append("security_severity = ?")
+        args.append(severity)
     if family:
         where.append("repos.distro_family = ?")
         args.append(family)
     if version:
         where.append("repos.release_version = ?")
         args.append(version)
+    if repo:
+        where.append("packages.repo_name = ?")
+        args.append(repo)
+    if package_format:
+        where.append("package_format = ?")
+        args.append(package_format)
+    if architecture:
+        where.append("architecture = ?")
+        args.append(architecture)
+    if checksum_algorithm:
+        where.append("checksum_algorithm = ?")
+        args.append(checksum_algorithm)
     base_sql = """
         SELECT packages.*, repos.distro_family, repos.release_version
         FROM packages
@@ -1243,7 +1376,16 @@ def api_packages(
         where_sql = " WHERE " + " AND ".join(where)
         base_sql += where_sql
         count_sql += where_sql
-    sql = base_sql + " ORDER BY security_status DESC, package, version, architecture LIMIT ? OFFSET ?"
+    order_by = {
+        "risk": "security_risk_score DESC, security_status DESC, package, version, architecture",
+        "package": "package COLLATE NOCASE, version, architecture",
+        "repo": "packages.repo_name COLLATE NOCASE, package COLLATE NOCASE, version, architecture",
+        "version": "version COLLATE NOCASE, package COLLATE NOCASE, architecture",
+        "status": "security_status DESC, security_severity DESC, security_risk_score DESC, package",
+        "severity": "CASE security_severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC, security_risk_score DESC, package",
+        "updated": "refreshed_at DESC, package COLLATE NOCASE, version",
+    }[sort]
+    sql = base_sql + f" ORDER BY {order_by} LIMIT ? OFFSET ?"
     page_args = [*args, limit, offset]
     with closing(connect_db()) as conn:
         filtered_total = conn.execute(count_sql, args).fetchone()["total"]
@@ -1265,9 +1407,24 @@ def api_packages(
                 """
             ).fetchone()
         )
+        filter_options = {
+            "architectures": [
+                row["architecture"]
+                for row in conn.execute(
+                    "SELECT DISTINCT architecture FROM packages WHERE architecture IS NOT NULL AND architecture != '' ORDER BY architecture COLLATE NOCASE"
+                )
+            ],
+            "checksum_algorithms": [
+                row["checksum_algorithm"]
+                for row in conn.execute(
+                    "SELECT DISTINCT checksum_algorithm FROM packages WHERE checksum_algorithm IS NOT NULL AND checksum_algorithm != '' ORDER BY checksum_algorithm COLLATE NOCASE"
+                )
+            ],
+        }
     return {
         "packages": rows,
         "totals": totals,
+        "filter_options": filter_options,
         "page": {
             "total": filtered_total,
             "returned": len(rows),
@@ -1366,7 +1523,16 @@ def dashboard_html() -> str:
     .section-head { display:flex; align-items:end; justify-content:space-between; gap:18px; margin:22px 0 12px; scroll-margin-top:84px; }
     h2 { margin:0; font-size:clamp(20px,2vw,28px); line-height:1.12; letter-spacing:0; }
     .muted { color: var(--muted); }
-    .toolbar { display:grid; grid-template-columns:minmax(240px,1fr) 170px 210px 170px; gap:12px; align-items:center; margin:16px 0; }
+    .toolbar-panel { margin:16px 0; padding:12px; border-radius:18px; background:var(--surface); border:1px solid var(--line); box-shadow:var(--shadow-soft); }
+    .toolbar-panel-head { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; margin-bottom:12px; }
+    .toolbar-panel-head h3 { margin:2px 0 4px; font-size:18px; }
+    .toolbar-panel-head p { margin:0; font-size:13px; }
+    .toolbar { display:grid; grid-template-columns:minmax(240px,1.4fr) repeat(4,minmax(145px,1fr)); gap:10px; align-items:end; }
+    .filter-field { display:grid; gap:6px; color:var(--muted); font-size:12px; font-weight:720; }
+    .filter-field label { color:var(--muted); }
+    .filter-actions { display:flex; gap:8px; justify-content:flex-end; flex-wrap:wrap; }
+    .filter-summary { display:flex; flex-wrap:wrap; gap:7px; margin-top:12px; min-height:26px; }
+    .filter-chip { display:inline-flex; align-items:center; gap:6px; min-height:26px; border-radius:999px; padding:4px 9px; background:var(--neutral-bg); color:var(--ink); border:1px solid var(--line); font-size:12px; font-weight:720; }
     input, select { width:100%; padding:0 14px; }
     .page-controls { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin:0 0 12px; color:var(--muted); font-size:13px; }
     .page-actions { display:flex; gap:10px; flex-wrap:wrap; }
@@ -1381,6 +1547,20 @@ def dashboard_html() -> str:
     .repo-core { min-height:132px; border-radius:14px; background:var(--surface); padding:14px; box-shadow:none; }
     .repo h3 { display:flex; align-items:center; justify-content:space-between; gap:10px; margin:0 0 14px; font-size:16px; }
     .repo p { margin:8px 0 0; color:var(--muted); font-size:13px; line-height:1.45; overflow-wrap:anywhere; }
+    .source-console { display:grid; grid-template-columns:minmax(300px,.95fr) minmax(360px,1.05fr); gap:14px; margin-bottom:16px; scroll-margin-top:90px; }
+    .source-panel { border-radius:18px; padding:16px; background:var(--surface); border:1px solid var(--line); box-shadow:var(--shadow-soft); }
+    .source-panel h3 { margin:8px 0 12px; font-size:clamp(22px,2.4vw,30px); line-height:1; }
+    .source-form { display:grid; grid-template-columns:1fr 130px; gap:10px; }
+    .source-form label { display:grid; gap:6px; color:var(--muted); font-size:12px; font-weight:720; }
+    .source-form .wide { grid-column:1 / -1; }
+    .source-form-actions { grid-column:1 / -1; display:flex; gap:10px; flex-wrap:wrap; margin-top:4px; }
+    .source-list { display:grid; gap:9px; max-height:420px; overflow:auto; padding-right:4px; }
+    .source-row { display:grid; grid-template-columns:1fr auto; gap:12px; align-items:center; padding:11px; border-radius:13px; background:color-mix(in srgb, var(--surface-2) 54%, var(--surface)); border:1px solid var(--line); }
+    .source-row strong, .source-row span { overflow-wrap:anywhere; }
+    .source-row p { margin:5px 0 0; color:var(--muted); font-size:12px; line-height:1.4; overflow-wrap:anywhere; }
+    .source-actions { display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end; }
+    .mini-button { height:32px; padding:4px 9px; box-shadow:none; font-size:12px; }
+    .source-packages { margin-top:12px; padding:12px; border-radius:14px; background:color-mix(in srgb, var(--primary-soft) 46%, transparent); border:1px solid color-mix(in srgb, var(--primary) 18%, var(--line)); }
     .families { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:12px; margin:0 0 34px; }
     .family { border-radius:16px; padding:14px; background:var(--surface); border:1px solid var(--line); box-shadow:var(--shadow-soft); }
     .family h3 { display:flex; align-items:center; gap:9px; margin:0 0 10px; font-size:15px; }
@@ -1439,6 +1619,12 @@ def dashboard_html() -> str:
     th:first-child, td:first-child { position:sticky; left:0; z-index:3; background:var(--surface); box-shadow:8px 0 18px rgba(18,33,54,.06); }
     th:first-child { z-index:4; }
     td .truncate { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:100%; }
+    .insight-cell { display:grid; gap:6px; min-width:0; max-width:100%; }
+    .insight-text { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; color:var(--ink); line-height:1.35; }
+    .insight-text.expanded { display:block; max-height:none; overflow:visible; }
+    .insight-toggle { all:unset; width:max-content; cursor:pointer; color:var(--primary-strong); font-size:12px; font-weight:760; line-height:1.2; }
+    .insight-toggle:hover { text-decoration:underline; }
+    .insight-toggle:focus-visible { outline:3px solid color-mix(in srgb, var(--primary) 28%, transparent); outline-offset:3px; border-radius:8px; }
     td:nth-child(1) { width:14%; font-weight:750; }
     td:nth-child(2) { width:17%; overflow-wrap:anywhere; font-variant-numeric:tabular-nums; }
     td:nth-child(3) { width:11%; }
@@ -1476,7 +1662,11 @@ def dashboard_html() -> str:
       .metrics { grid-template-columns:repeat(2,minmax(120px,1fr)); }
       .security-grid { grid-template-columns:1fr; }
       .scan-console { grid-template-columns:1fr; }
+      .source-console { grid-template-columns:1fr; }
+      .source-form { grid-template-columns:1fr; }
       .toolbar { grid-template-columns:1fr; }
+      .toolbar-panel-head { flex-direction:column; }
+      .filter-actions { justify-content:flex-start; }
       .section-head { align-items:flex-start; flex-direction:column; }
       .table-wrap { display:none; }
       .package-cards { display:grid; }
@@ -1499,6 +1689,7 @@ def dashboard_html() -> str:
         <a href="#overview">Overview</a>
         <a href="#security-section">Security</a>
         <a href="#scan-section">Scans</a>
+        <a href="#source-section">Sources</a>
         <a href="#repo-section">Repositories</a>
         <a href="#packages-table">Packages</a>
       </div>
@@ -1562,8 +1753,31 @@ def dashboard_html() -> str:
           <div class="eyebrow">Repository sources</div>
           <h2>Mirror health</h2>
         </div>
-        <p class="muted">Status, package counts, and last refresh time for each configured APT or RPM source.</p>
+        <p class="muted">Status, package counts, and last refresh time for each APT or RPM source.</p>
       </div>
+      <section class="source-console" id="source-section" aria-label="Repository source management">
+        <article class="source-panel">
+          <div class="eyebrow">Source editor</div>
+          <h3>Add or edit a repository</h3>
+          <form class="source-form" id="source-form">
+            <label class="wide">Source name<input id="repo-name" required placeholder="oracle-9-appstream"></label>
+            <label>Type<select id="repo-type"><option value="apt">APT / DEB</option><option value="rpm">RPM / RHEL family</option></select></label>
+            <label>Suite / distro<input id="repo-suite" required placeholder="bookworm or Oracle Linux 9"></label>
+            <label class="wide">Base URL<input id="repo-base-url" required placeholder="https://example.repo/os/"></label>
+            <label class="wide">Component / channel<input id="repo-component" required placeholder="main, BaseOS, AppStream, Latest"></label>
+            <div class="source-form-actions">
+              <button id="save-source" type="submit">Save source <span class="button-orb" aria-hidden="true"><svg><use href="#icon-arrow"></use></svg></span></button>
+              <button class="secondary" id="new-source" type="button">New source <span class="button-orb" aria-hidden="true"><svg><use href="#icon-refresh"></use></svg></span></button>
+            </div>
+          </form>
+          <div class="source-packages" id="source-focus">Select a source to edit it or show only its packages.</div>
+        </article>
+        <article class="source-panel">
+          <div class="eyebrow">Configured sources</div>
+          <h3>Open source inventory</h3>
+          <div class="source-list" id="source-list"></div>
+        </article>
+      </section>
       <section class="repos" id="repos"></section>
       <div class="section-head">
         <div>
@@ -1571,20 +1785,64 @@ def dashboard_html() -> str:
           <h2>Package intelligence table</h2>
         </div>
       </div>
-      <div class="toolbar" role="search">
-        <input id="q" aria-label="Search packages" placeholder="Search package, maintainer, description">
-        <select id="status" aria-label="Filter by security status">
-          <option value="">All statuses</option>
-          <option value="failed">Failed</option>
-          <option value="review">Review</option>
-          <option value="passed">Passed</option>
-        </select>
-        <select id="family" aria-label="Filter by distribution family">
-          <option value="">All families</option>
-        </select>
-        <select id="version" aria-label="Filter by operating system version">
-          <option value="">All versions</option>
-        </select>
+      <div class="toolbar-panel" role="search" aria-label="Package inventory controls">
+        <div class="toolbar-panel-head">
+          <div>
+            <div class="eyebrow">Inventory controls</div>
+            <h3>Filter every package field</h3>
+            <p class="muted">Combine status, severity, source, OS lane, architecture, format, checksum, and sort order.</p>
+          </div>
+          <div class="filter-actions">
+            <button class="secondary" id="reset-filters" type="button">Reset filters <span class="button-orb" aria-hidden="true"><svg><use href="#icon-refresh"></use></svg></span></button>
+          </div>
+        </div>
+        <div class="toolbar">
+          <div class="filter-field"><label for="q">Search</label><input id="q" aria-label="Search packages" placeholder="Package, maintainer, description"></div>
+          <div class="filter-field"><label for="status">Status</label><select id="status" aria-label="Filter by security status">
+            <option value="">All statuses</option>
+            <option value="failed">Failed</option>
+            <option value="review">Review</option>
+            <option value="passed">Passed</option>
+          </select></div>
+          <div class="filter-field"><label for="severity">Severity</label><select id="severity" aria-label="Filter by security severity">
+            <option value="">All severities</option>
+            <option value="critical">Critical</option>
+            <option value="high">High</option>
+            <option value="medium">Medium</option>
+            <option value="low">Low</option>
+            <option value="none">None</option>
+          </select></div>
+          <div class="filter-field"><label for="family">Distribution</label><select id="family" aria-label="Filter by distribution family">
+            <option value="">All families</option>
+          </select></div>
+          <div class="filter-field"><label for="version">OS version</label><select id="version" aria-label="Filter by operating system version">
+            <option value="">All versions</option>
+          </select></div>
+          <div class="filter-field"><label for="repo-filter">Repository</label><select id="repo-filter" aria-label="Filter by repository source">
+            <option value="">All repository sources</option>
+          </select></div>
+          <div class="filter-field"><label for="format">Format</label><select id="format" aria-label="Filter by package format">
+            <option value="">All formats</option>
+            <option value="deb">DEB</option>
+            <option value="rpm">RPM</option>
+          </select></div>
+          <div class="filter-field"><label for="architecture">Architecture</label><select id="architecture" aria-label="Filter by package architecture">
+            <option value="">All architectures</option>
+          </select></div>
+          <div class="filter-field"><label for="checksum">Checksum</label><select id="checksum" aria-label="Filter by checksum algorithm">
+            <option value="">All checksums</option>
+          </select></div>
+          <div class="filter-field"><label for="sort">Sort by</label><select id="sort" aria-label="Sort packages">
+            <option value="risk">Risk first</option>
+            <option value="severity">Severity</option>
+            <option value="status">Status</option>
+            <option value="package">Package name</option>
+            <option value="repo">Repository</option>
+            <option value="version">Version</option>
+            <option value="updated">Last refresh</option>
+          </select></div>
+        </div>
+        <div class="filter-summary" id="filter-summary" aria-live="polite"></div>
       </div>
       <section class="table-shell" id="packages-table">
         <div class="page-controls">
@@ -1613,6 +1871,7 @@ def dashboard_html() -> str:
     const esc = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const PAGE_LIMIT = 100;
     let currentOffset = 0;
+    let editingSourceName = '';
     const icon = (name) => `<span class="button-orb" aria-hidden="true"><svg><use href="#icon-${name}"></use></svg></span>`;
     const setTheme = (theme) => {
       document.documentElement.dataset.theme = theme;
@@ -1623,12 +1882,54 @@ def dashboard_html() -> str:
     const skeletonCards = () => Array.from({length: 4}).map(() => '<article class="package-card"><div class="skeleton"></div><br><div class="skeleton"></div><br><div class="skeleton"></div></article>').join('');
     const statusClass = (value) => ['passed', 'review', 'failed', 'pending'].includes(value) ? value : 'pending';
     const n = (value) => Number(value || 0).toLocaleString();
+    const insightCell = (text, label) => {
+      const value = String(text || 'none');
+      const needsToggle = value.length > 92;
+      return `<div class="insight-cell" data-expanded="false"><span class="insight-text" title="${esc(value)}">${esc(value)}</span>${needsToggle ? `<button class="insight-toggle" type="button" aria-expanded="false" aria-label="Show full ${esc(label)}">Show more</button>` : ''}</div>`;
+    };
+    const filterIds = ['q', 'status', 'severity', 'family', 'version', 'repo-filter', 'format', 'architecture', 'checksum', 'sort'];
+    const selectedFilters = () => ({
+      q: $('q').value.trim(),
+      status: $('status').value,
+      severity: $('severity').value,
+      family: $('family').value,
+      version: $('version').value,
+      repo: $('repo-filter').value,
+      package_format: $('format').value,
+      architecture: $('architecture').value,
+      checksum_algorithm: $('checksum').value,
+      sort: $('sort').value
+    });
+    const setSelectOptions = (id, placeholder, values, current, formatter = (value) => value) => {
+      const options = [...new Set(values.filter(Boolean))];
+      $(id).innerHTML = `<option value="">${placeholder}</option>` + options.map(value => `<option value="${esc(value)}">${esc(formatter(value))}</option>`).join('');
+      $(id).value = options.includes(current) ? current : '';
+    };
+    const renderFilterSummary = (page) => {
+      const filters = selectedFilters();
+      const labels = [
+        ['Search', filters.q],
+        ['Status', filters.status],
+        ['Severity', filters.severity],
+        ['Family', filters.family],
+        ['OS', filters.version],
+        ['Repo', filters.repo],
+        ['Format', filters.package_format ? filters.package_format.toUpperCase() : ''],
+        ['Arch', filters.architecture],
+        ['Checksum', filters.checksum_algorithm ? filters.checksum_algorithm.toUpperCase() : ''],
+        ['Sort', $('sort').selectedOptions[0]?.textContent || 'Risk first']
+      ].filter(([, value]) => value);
+      $('filter-summary').innerHTML = labels.length
+        ? labels.map(([key, value]) => `<span class="filter-chip">${esc(key)}: ${esc(value)}</span>`).join('') + `<span class="filter-chip">${n(page.total || 0)} matches</span>`
+        : `<span class="filter-chip">${n(page.total || 0)} packages across all filters</span>`;
+    };
     async function load() {
       $('packages').innerHTML = skeletonRows();
       $('package-cards').innerHTML = skeletonCards();
       $('page-info').textContent = 'Loading package results...';
       try {
-        const params = new URLSearchParams({ q: $('q').value, status: $('status').value, family: $('family').value, version: $('version').value, limit: String(PAGE_LIMIT), offset: String(currentOffset) });
+        const filters = selectedFilters();
+        const params = new URLSearchParams({ ...filters, limit: String(PAGE_LIMIT), offset: String(currentOffset) });
         const [repos, families, versions, security, scans, packages] = await Promise.all([fetch('/api/repos').then(r => r.json()), fetch('/api/families').then(r => r.json()), fetch('/api/versions').then(r => r.json()), fetch('/api/security').then(r => r.json()), fetch('/api/scans').then(r => r.json()), fetch('/api/packages?' + params).then(r => r.json())]);
         const totals = packages.totals || {};
         $('hero-summary').innerHTML = [
@@ -1653,25 +1954,45 @@ def dashboard_html() -> str:
         const familyValue = $('family').value;
         $('family').innerHTML = '<option value="">All families</option>' + families.map(f => `<option value="${esc(f.distro_family)}">${esc(f.distro_family)}</option>`).join('');
         $('family').value = familyValue;
+        const repoFilterValue = $('repo-filter').value;
+        $('repo-filter').innerHTML = '<option value="">All repository sources</option>' + repos.map(r => `<option value="${esc(r.name)}">${esc(r.name)} · ${esc((r.repo_type || 'apt').toUpperCase())}</option>`).join('');
+        $('repo-filter').value = repos.some(r => r.name === repoFilterValue) ? repoFilterValue : '';
         const selectedFamilyVersions = $('family').value ? versions.filter(v => v.distro_family === $('family').value) : versions;
         const versionValue = $('version').value;
         const versionOptions = [...new Set(selectedFamilyVersions.flatMap(v => v.versions.map(item => item.release_version)))].sort((a, b) => Number(b) - Number(a));
         $('version').innerHTML = '<option value="">All versions</option>' + versionOptions.map(v => `<option value="${esc(v)}">${esc(v)}</option>`).join('');
         $('version').value = versionOptions.includes(versionValue) ? versionValue : '';
+        const filterOptions = packages.filter_options || {};
+        setSelectOptions('architecture', 'All architectures', filterOptions.architectures || [], $('architecture').value);
+        setSelectOptions('checksum', 'All checksums', filterOptions.checksum_algorithms || [], $('checksum').value, value => value.toUpperCase());
         $('families').innerHTML = families.length ? families.map(f => {
           const pills = (f.versions || []).map(v => `<span class="version-pill">v${esc(v.release_version)} - ${n(v.packages)} pkgs</span>`).join('');
           return `<article class="family" data-family="${esc(f.distro_family)}"><h3><span class="family-dot"></span>${esc(f.distro_family)}</h3><dl><div><dt>Repos</dt><dd>${n(f.repos)}</dd></div><div><dt>Versions</dt><dd>${n(f.version_count)}</dd></div><div><dt>Healthy mirrors</dt><dd>${n(f.healthy)}</dd></div><div><dt>Mirror sync errors</dt><dd>${n(f.errors)}</dd></div></dl><div class="version-strip">${pills || '<span class="version-pill">No versions</span>'}</div></article>`;
         }).join('') : '<article class="family"><h3><span class="family-dot"></span>No family data</h3></article>';
-        $('repos').innerHTML = repos.length ? repos.map((r, i) => `<article class="repo" style="animation-delay:${i * 70}ms"><div class="repo-core"><h3>${esc(r.name)} <span class="badge ${r.status === 'ok' ? 'passed' : 'failed'}">${esc(r.status)}</span></h3><p><span class="badge pending">${esc(r.distro_family || (r.repo_type || 'apt').toUpperCase())}</span> <span class="badge pending">v${esc(r.release_version || 'n/a')}</span> <span class="badge pending">${esc((r.repo_type || 'apt').toUpperCase())}</span></p><p>${esc(r.base_url)}</p><p>${esc(r.suite)}/${esc(r.component)} - ${n(r.package_count)} packages</p><p>Refreshed ${esc(r.last_refresh || 'never')}</p>${r.error ? `<p class="error">${esc(r.error)}</p>` : ''}</div></article>`).join('') : '<article class="repo"><div class="repo-core"><h3>No repositories configured</h3><p>Add APT_REPOS or RPM_REPOS entries to begin indexing.</p></div></article>';
+        const activeRepo = repos.find(r => r.name === $('repo-filter').value);
+        $('source-focus').innerHTML = activeRepo ? `<strong>${esc(activeRepo.name)}</strong><br><span class="muted">${n(activeRepo.package_count)} packages from ${esc(activeRepo.distro_family)} ${esc(activeRepo.release_version || '')}. The package table is filtered to this source.</span>` : 'Select a source to edit it or show only its packages.';
+        $('source-list').innerHTML = repos.length ? repos.map(r => `<div class="source-row"><div><strong>${esc(r.name)}</strong> <span class="badge ${r.status === 'ok' ? 'passed' : r.status === 'error' ? 'failed' : 'pending'}">${esc(r.status)}</span><p>${esc(r.base_url)}</p><p>${esc(r.suite)}/${esc(r.component)} · ${esc(r.distro_family)} v${esc(r.release_version || 'n/a')} · ${n(r.package_count)} packages</p></div><div class="source-actions"><button class="secondary mini-button" data-source-edit="${esc(r.name)}" type="button">Edit</button><button class="ghost mini-button" data-source-packages="${esc(r.name)}" type="button">Packages</button></div></div>`).join('') : '<div class="source-row"><div><strong>No sources configured</strong><p>Add an APT or RPM source to begin indexing.</p></div></div>';
+        document.querySelectorAll('[data-source-edit]').forEach(button => button.addEventListener('click', () => editSource(repos.find(r => r.name === button.dataset.sourceEdit))));
+        document.querySelectorAll('[data-source-packages]').forEach(button => button.addEventListener('click', () => showRepoPackages(button.dataset.sourcePackages)));
+        $('repos').innerHTML = repos.length ? repos.map((r, i) => `<article class="repo" style="animation-delay:${i * 70}ms"><div class="repo-core"><h3>${esc(r.name)} <span class="badge ${r.status === 'ok' ? 'passed' : r.status === 'error' ? 'failed' : 'pending'}">${esc(r.status)}</span></h3><p><span class="badge pending">${esc(r.distro_family || (r.repo_type || 'apt').toUpperCase())}</span> <span class="badge pending">v${esc(r.release_version || 'n/a')}</span> <span class="badge pending">${esc((r.repo_type || 'apt').toUpperCase())}</span></p><p>${esc(r.base_url)}</p><p>${esc(r.suite)}/${esc(r.component)} - ${n(r.package_count)} packages</p><p>Refreshed ${esc(r.last_refresh || 'never')}</p>${r.error ? `<p class="error">${esc(r.error)}</p>` : ''}</div></article>`).join('') : '<article class="repo"><div class="repo-core"><h3>No repositories configured</h3><p>Add a repository source to begin indexing.</p></div></article>';
         const page = packages.page || { total: packages.packages.length, returned: packages.packages.length, offset: currentOffset, limit: PAGE_LIMIT, has_more: false };
         const start = page.total ? page.offset + 1 : 0;
         const end = page.offset + page.returned;
         $('page-info').textContent = `Showing ${n(start)}-${n(end)} of ${n(page.total)} matching packages`;
+        renderFilterSummary(page);
         $('prev-page').disabled = page.offset <= 0;
         $('next-page').disabled = !page.has_more;
-        $('packages').innerHTML = packages.packages.length ? packages.packages.map(p => `<tr><td><button class="details-button truncate" title="${esc(p.package)}" data-package-id="${esc(p.id)}">${esc(p.package)}</button></td><td><span class="truncate" title="${esc(p.version)}">${esc(p.version)}</span></td><td><span class="truncate" title="${esc(p.repo_name)}">${esc(p.repo_name)}</span><span class="muted truncate">${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</span></td><td>${esc(p.architecture || 'n/a')}</td><td><span class="truncate" title="${esc(p.category)}">${esc(p.category)}</span><span class="muted truncate" title="${esc(p.responsibility)}">${esc(p.responsibility)}</span></td><td>${esc((p.package_format || 'deb').toUpperCase())}<br><span class="muted">${esc((p.checksum_algorithm || '').toUpperCase())}</span></td><td><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span></td><td><span class="badge ${esc(p.security_severity || 'none')}">${esc(p.security_severity || 'none')}</span></td><td>${n(p.security_risk_score)}</td><td><span class="truncate" title="${esc(p.why_not_safe || 'none')}">${esc(p.why_not_safe || 'none')}</span></td><td class="muted"><span class="truncate" title="${esc(p.primary_purpose || (p.description || '').split('\\n')[0])}">${esc(p.primary_purpose || (p.description || '').split('\\n')[0])}</span></td></tr>`).join('') : '<tr><td colspan="7"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></td><td colspan="4"></td></tr>';
-        $('package-cards').innerHTML = packages.packages.length ? packages.packages.map(p => `<article class="package-card"><h3><button class="details-button" data-package-id="${esc(p.id)}">${esc(p.package)}</button></h3><div class="package-meta"><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span><span class="badge ${esc(p.security_severity || 'none')}">${esc(p.security_severity || 'none')}</span><span class="badge pending">${esc(p.architecture || 'n/a')}</span><span class="badge pending">${esc((p.package_format || 'deb').toUpperCase())}</span></div><dl><div><dt>Version</dt><dd>${esc(p.version)}</dd></div><div><dt>Repo</dt><dd>${esc(p.repo_name)} · ${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</dd></div><div><dt>Responsible for</dt><dd>${esc(p.responsibility)}</dd></div><div><dt>Why unsafe</dt><dd>${esc(p.why_not_safe || 'none')}</dd></div><div><dt>Purpose</dt><dd>${esc(p.primary_purpose || (p.description || '').split('\\n')[0])}</dd></div></dl></article>`).join('') : '<article class="package-card"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></article>';
+        $('packages').innerHTML = packages.packages.length ? packages.packages.map(p => `<tr><td><button class="details-button truncate" title="${esc(p.package)}" data-package-id="${esc(p.id)}">${esc(p.package)}</button></td><td><span class="truncate" title="${esc(p.version)}">${esc(p.version)}</span></td><td><span class="truncate" title="${esc(p.repo_name)}">${esc(p.repo_name)}</span><span class="muted truncate">${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</span></td><td>${esc(p.architecture || 'n/a')}</td><td><span class="truncate" title="${esc(p.category)}">${esc(p.category)}</span><span class="muted truncate" title="${esc(p.responsibility)}">${esc(p.responsibility)}</span></td><td>${esc((p.package_format || 'deb').toUpperCase())}<br><span class="muted">${esc((p.checksum_algorithm || '').toUpperCase())}</span></td><td><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span></td><td><span class="badge ${esc(p.security_severity || 'none')}">${esc(p.security_severity || 'none')}</span></td><td>${n(p.security_risk_score)}</td><td>${insightCell(p.why_not_safe || 'none', 'unsafe reason')}</td><td class="muted">${insightCell(p.primary_purpose || (p.description || '').split('\\n')[0], 'package purpose')}</td></tr>`).join('') : '<tr><td colspan="7"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></td><td colspan="4"></td></tr>';
+        $('package-cards').innerHTML = packages.packages.length ? packages.packages.map(p => `<article class="package-card"><h3><button class="details-button" data-package-id="${esc(p.id)}">${esc(p.package)}</button></h3><div class="package-meta"><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span><span class="badge ${esc(p.security_severity || 'none')}">${esc(p.security_severity || 'none')}</span><span class="badge pending">${esc(p.architecture || 'n/a')}</span><span class="badge pending">${esc((p.package_format || 'deb').toUpperCase())}</span></div><dl><div><dt>Version</dt><dd>${esc(p.version)}</dd></div><div><dt>Repo</dt><dd>${esc(p.repo_name)} · ${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</dd></div><div><dt>Responsible for</dt><dd>${esc(p.responsibility)}</dd></div><div><dt>Why unsafe</dt><dd>${insightCell(p.why_not_safe || 'none', 'unsafe reason')}</dd></div><div><dt>Purpose</dt><dd>${insightCell(p.primary_purpose || (p.description || '').split('\\n')[0], 'package purpose')}</dd></div></dl></article>`).join('') : '<article class="package-card"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></article>';
         document.querySelectorAll('.details-button').forEach(button => button.addEventListener('click', () => showPackage(button.dataset.packageId)));
+        document.querySelectorAll('.insight-toggle').forEach(button => button.addEventListener('click', () => {
+          const cell = button.closest('.insight-cell');
+          const expanded = cell.dataset.expanded === 'true';
+          cell.dataset.expanded = expanded ? 'false' : 'true';
+          cell.querySelector('.insight-text').classList.toggle('expanded', !expanded);
+          button.textContent = expanded ? 'Show more' : 'Show less';
+          button.setAttribute('aria-expanded', String(!expanded));
+        }));
       } catch (error) {
         $('packages').innerHTML = `<tr><td colspan="11"><div class="state error"><strong>Could not load package data</strong>${esc(error.message || error)}</div></td></tr>`;
         $('package-cards').innerHTML = `<article class="package-card"><div class="state error"><strong>Could not load package data</strong>${esc(error.message || error)}</div></article>`;
@@ -1691,15 +2012,81 @@ def dashboard_html() -> str:
       $('remediation').innerHTML = `<div class="eyebrow">Package intelligence</div><h3>${esc(p.package)}</h3><div class="package-brief"><div class="brief-row"><span>Responsible for</span><strong>${esc(p.responsibility)}</strong></div><div class="brief-row"><span>Package purpose</span><strong>${esc(p.primary_purpose)}</strong></div><div class="brief-row"><span>Why it is not safe</span><strong>${esc(p.why_not_safe)}</strong></div><div class="brief-row"><span>Internal owner lane</span><strong>${esc(p.operational_owner)}</strong></div><div class="brief-row"><span>Upstream maintainer from package metadata</span><strong>${esc(p.upstream_maintainer)}</strong></div><div class="brief-row"><span>Architecture</span><strong>${esc(p.architecture || 'n/a')}</strong></div><div class="brief-row"><span>Checksum algorithm</span><strong>${esc((p.checksum_algorithm || 'unknown').toUpperCase())}</strong></div><div class="brief-row"><span>Impact</span><strong>${esc(p.impact)}</strong></div></div><p class="muted">${esc(p.recommended_action)}</p><div class="remediation-list">${steps || '<div class="remediation-item"><strong>No remediation required</strong><span class="muted">This package currently passes validation.</span></div>'}</div>`;
       document.querySelector('.scan-console').scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
+    function editSource(repo) {
+      if (!repo) return;
+      editingSourceName = repo.name;
+      $('repo-name').value = repo.name;
+      $('repo-type').value = repo.repo_type || 'apt';
+      $('repo-base-url').value = repo.base_url || '';
+      $('repo-suite').value = repo.suite || '';
+      $('repo-component').value = repo.component || '';
+      $('source-focus').innerHTML = `<strong>Editing ${esc(repo.name)}</strong><br><span class="muted">Save updates the source definition. Run Refresh index afterward to re-fetch package metadata.</span>`;
+      document.querySelector('#source-section').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+    function resetSourceForm() {
+      editingSourceName = '';
+      $('source-form').reset();
+      $('repo-type').value = 'apt';
+      $('source-focus').textContent = 'Add a new APT or RPM source, then run Refresh index to import its packages.';
+    }
+    function showRepoPackages(repoName) {
+      $('repo-filter').value = repoName;
+      currentOffset = 0;
+      load();
+      document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+    function resetFilters() {
+      $('q').value = '';
+      $('status').value = '';
+      $('severity').value = '';
+      $('family').value = '';
+      $('version').value = '';
+      $('repo-filter').value = '';
+      $('format').value = '';
+      $('architecture').value = '';
+      $('checksum').value = '';
+      $('sort').value = 'risk';
+      currentOffset = 0;
+      load();
+    }
+    async function saveSource(event) {
+      event.preventDefault();
+      const payload = {
+        name: $('repo-name').value.trim(),
+        repo_type: $('repo-type').value,
+        base_url: $('repo-base-url').value.trim(),
+        suite: $('repo-suite').value.trim(),
+        component: $('repo-component').value.trim()
+      };
+      const target = editingSourceName ? '/api/repos/' + encodeURIComponent(editingSourceName) : '/api/repos';
+      const method = editingSourceName ? 'PUT' : 'POST';
+      $('save-source').disabled = true;
+      try {
+        const response = await fetch(target, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
+          throw new Error(body.detail || body.error || `Save failed with HTTP ${response.status}`);
+        }
+        editingSourceName = payload.name;
+        $('repo-filter').value = payload.name;
+        await load();
+        $('source-focus').innerHTML = `<strong>${esc(payload.name)} saved</strong><br><span class="muted">Run Refresh index to import or update all packages from this source.</span>`;
+      } catch (error) {
+        $('source-focus').innerHTML = `<strong class="error">Could not save source</strong><br><span class="muted">${esc(error.message || error)}</span>`;
+      } finally {
+        $('save-source').disabled = false;
+      }
+    }
     $('refresh').addEventListener('click', async () => { $('refresh').disabled = true; $('refresh').innerHTML = `Refreshing ${icon('refresh')}`; await fetch('/api/refresh', { method: 'POST' }); $('refresh').disabled = false; $('refresh').innerHTML = `Refresh index ${icon('refresh')}`; load(); });
     $('scan').addEventListener('click', runScan);
     $('show-review').addEventListener('click', () => { $('status').value = 'review'; currentOffset = 0; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
     $('prev-page').addEventListener('click', () => { currentOffset = Math.max(0, currentOffset - PAGE_LIMIT); load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
     $('next-page').addEventListener('click', () => { currentOffset += PAGE_LIMIT; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
     $('q').addEventListener('input', () => clearTimeout(window.__t) || (window.__t = setTimeout(() => { currentOffset = 0; load(); }, 250)));
-    $('status').addEventListener('change', () => { currentOffset = 0; load(); });
-    $('family').addEventListener('change', () => { currentOffset = 0; load(); });
-    $('version').addEventListener('change', () => { currentOffset = 0; load(); });
+    filterIds.filter(id => id !== 'q').forEach(id => $(id).addEventListener('change', () => { currentOffset = 0; load(); }));
+    $('reset-filters').addEventListener('click', resetFilters);
+    $('source-form').addEventListener('submit', saveSource);
+    $('new-source').addEventListener('click', resetSourceForm);
     $('theme-toggle').addEventListener('click', () => setTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'));
     setTheme(localStorage.getItem('pkgmng-theme') || 'light');
     load();
