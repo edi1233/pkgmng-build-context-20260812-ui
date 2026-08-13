@@ -1323,57 +1323,66 @@ def dashboard_html() -> str:
   <meta name="description" content="APT and RPM repository index with package metadata and security review status.">
   <title>pkgmng | Linux package control</title>
   <style>
-    :root { color-scheme: light; --ink:#101418; --muted:#66727f; --line:#d7dde5; --accent:#0a6f64; --accent-2:#d7f36a; --bad:#a9342c; --warn:#8a641a; --ok:#087443; --rh:#c52032; --oracle:#c74634; --rocky:#10b981; --alma:#2563eb; --shadow:0 22px 70px rgba(32,45,58,.12); --ease:cubic-bezier(.32,.72,0,1); }
+    :root { color-scheme: light; --bg:#f5f7fb; --surface:#ffffff; --surface-2:#eef3f7; --ink:#101722; --muted:#657386; --soft:#8090a3; --line:#d7e0ea; --primary:#0f4c81; --primary-strong:#09365f; --primary-soft:#dcebf8; --brand:#7ac142; --ok:#087443; --ok-bg:#dff5e8; --low:#2f855a; --low-bg:#e4f7ee; --medium:#946200; --medium-bg:#fff0c2; --high:#b45309; --high-bg:#ffe2c2; --critical:#bd1e2d; --critical-bg:#ffe0e3; --neutral-bg:#e8edf3; --rh:#c52032; --oracle:#c74634; --rocky:#10b981; --alma:#2563eb; --shadow:0 18px 52px rgba(18,33,54,.12); --shadow-soft:0 8px 22px rgba(18,33,54,.08); --ease:cubic-bezier(.32,.72,0,1); }
+    [data-theme="dark"] { color-scheme: dark; --bg:#0b1119; --surface:#101824; --surface-2:#172231; --ink:#eef5ff; --muted:#a8b7ca; --soft:#8294aa; --line:#263447; --primary:#5aa7e8; --primary-strong:#8bc6ff; --primary-soft:#122f49; --brand:#8ccf4d; --ok:#61d394; --ok-bg:#103724; --low:#7dd3a7; --low-bg:#113322; --medium:#f0b84b; --medium-bg:#3b2c0b; --high:#fb923c; --high-bg:#44230c; --critical:#fb7185; --critical-bg:#46131c; --neutral-bg:#263447; --shadow:0 18px 58px rgba(0,0,0,.34); --shadow-soft:0 10px 28px rgba(0,0,0,.24); }
     * { box-sizing: border-box; }
     html { scroll-behavior: smooth; }
-    body { margin: 0; font-family: "Aptos", "Segoe UI Variable", ui-sans-serif, system-ui, sans-serif; background: radial-gradient(circle at 82% -10%, rgba(215,243,106,.38), transparent 26rem), radial-gradient(circle at 4% 8%, rgba(10,111,100,.14), transparent 24rem), linear-gradient(145deg, #f8faf8 0%, #eef3f1 46%, #f9faf7 100%); color: var(--ink); min-height: 100dvh; }
-    body::before { content:""; position: fixed; inset:0; pointer-events:none; z-index:5; opacity:.055; background-image: linear-gradient(90deg, rgba(16,20,24,.12) 1px, transparent 1px), linear-gradient(rgba(16,20,24,.12) 1px, transparent 1px); background-size:42px 42px; mask-image:linear-gradient(to bottom, rgba(0,0,0,.7), transparent 60%); }
+    body { margin: 0; font-family: "Aptos", "Segoe UI Variable", ui-sans-serif, system-ui, sans-serif; background: radial-gradient(circle at 82% -10%, rgba(15,76,129,.14), transparent 28rem), radial-gradient(circle at 5% 10%, rgba(122,193,66,.11), transparent 20rem), linear-gradient(145deg, var(--bg) 0%, var(--surface-2) 52%, var(--bg) 100%); color: var(--ink); min-height: 100dvh; }
+    body::before { content:""; position: fixed; inset:0; pointer-events:none; z-index:5; opacity:.04; background-image: linear-gradient(90deg, currentColor 1px, transparent 1px), linear-gradient(currentColor 1px, transparent 1px); background-size:42px 42px; mask-image:linear-gradient(to bottom, rgba(0,0,0,.7), transparent 60%); }
     .skip-link { position:absolute; left:-999px; top:10px; padding:10px 14px; background:#fff; color:var(--ink); z-index:10; border-radius:999px; }
     .skip-link:focus { left:16px; }
     .page { position:relative; z-index:1; max-width:1480px; margin:0 auto; padding:24px; }
-    header { min-height:62dvh; display:grid; grid-template-columns:minmax(0,1.1fr) minmax(340px,.9fr); gap:28px; align-items:stretch; padding:22px 0 34px; }
+    .console-nav { position:sticky; top:14px; z-index:4; display:flex; align-items:center; justify-content:space-between; gap:12px; margin:0 0 18px; padding:8px; border-radius:18px; background:color-mix(in srgb, var(--surface) 86%, transparent); border:1px solid color-mix(in srgb, var(--line) 82%, transparent); box-shadow:var(--shadow-soft); backdrop-filter:blur(18px); }
+    .nav-links { display:flex; align-items:center; gap:4px; overflow:auto; }
+    .nav-links a { display:inline-flex; align-items:center; min-height:34px; padding:0 12px; border-radius:12px; color:var(--muted); text-decoration:none; font-size:13px; font-weight:720; white-space:nowrap; transition:background .45s var(--ease), color .45s var(--ease), transform .45s var(--ease); }
+    .nav-links a:hover { background:var(--primary-soft); color:var(--primary-strong); transform:translateY(-1px); }
+    .theme-toggle { height:34px; padding:4px 6px 4px 11px; color:var(--ink); background:var(--surface-2); border:1px solid var(--line); box-shadow:none; }
+    header { min-height:56dvh; display:grid; grid-template-columns:minmax(0,1.08fr) minmax(340px,.92fr); gap:24px; align-items:stretch; padding:20px 0 28px; }
     .brandbar { display:flex; align-items:center; justify-content:space-between; gap:14px; margin-bottom:64px; }
     .mark { display:flex; align-items:center; gap:10px; font-weight:750; }
-    .mark-dot { width:30px; height:30px; border-radius:10px; background:var(--ink); box-shadow:inset 0 0 0 8px var(--accent-2); }
-    .eyebrow { color:var(--accent); font-size:11px; text-transform:uppercase; letter-spacing:.18em; font-weight:760; }
-    h1 { margin:18px 0 16px; max-width:850px; font-size:clamp(44px,7vw,108px); line-height:.91; letter-spacing:0; text-wrap:balance; }
+    .mark-dot { width:30px; height:30px; border-radius:10px; background:var(--primary); box-shadow:inset 0 0 0 8px var(--brand); }
+    .eyebrow { color:var(--primary); font-size:11px; text-transform:uppercase; letter-spacing:.18em; font-weight:760; }
+    h1 { margin:18px 0 16px; max-width:850px; font-size:clamp(44px,7vw,96px); line-height:.94; letter-spacing:0; text-wrap:balance; }
     .lede { margin:0; max-width:58ch; color:#40505c; font-size:clamp(17px,2vw,21px); line-height:1.55; }
     .hero-actions { display:flex; align-items:center; flex-wrap:wrap; gap:12px; margin-top:30px; }
-    button, select, input { font:inherit; border:1px solid rgba(16,20,24,.13); border-radius:14px; background:rgba(255,255,255,.82); color:var(--ink); height:44px; transition:transform .55s var(--ease), border-color .55s var(--ease), background .55s var(--ease), box-shadow .55s var(--ease); }
-    button { display:inline-flex; align-items:center; gap:12px; border:0; border-radius:999px; padding:6px 8px 6px 18px; background:var(--ink); color:#fff; cursor:pointer; box-shadow:0 18px 44px rgba(16,20,24,.18); white-space:nowrap; }
-    button:hover { transform:translateY(-2px); box-shadow:0 24px 56px rgba(16,20,24,.22); }
+    button, select, input { font:inherit; border:1px solid color-mix(in srgb, var(--line) 92%, transparent); border-radius:12px; background:color-mix(in srgb, var(--surface) 88%, transparent); color:var(--ink); height:42px; transition:transform .55s var(--ease), border-color .55s var(--ease), background .55s var(--ease), box-shadow .55s var(--ease); }
+    button { display:inline-flex; align-items:center; gap:10px; border:0; border-radius:999px; padding:5px 7px 5px 16px; background:var(--primary); color:#fff; cursor:pointer; box-shadow:0 15px 34px color-mix(in srgb, var(--primary) 28%, transparent); white-space:nowrap; font-weight:760; }
+    button:hover { transform:translateY(-2px); background:var(--primary-strong); box-shadow:0 20px 46px color-mix(in srgb, var(--primary) 30%, transparent); }
     button:active { transform:translateY(1px) scale(.98); }
-    button:focus-visible, input:focus-visible, select:focus-visible { outline:3px solid rgba(10,111,100,.22); outline-offset:3px; }
+    button:focus-visible, input:focus-visible, select:focus-visible { outline:3px solid color-mix(in srgb, var(--primary) 28%, transparent); outline-offset:3px; }
     button[disabled] { opacity:.68; cursor:progress; }
-    .button-orb { display:grid; place-items:center; width:32px; height:32px; border-radius:999px; background:var(--accent-2); color:var(--ink); transition:transform .55s var(--ease); }
+    .button-orb { display:grid; place-items:center; width:30px; height:30px; border-radius:999px; background:color-mix(in srgb, #fff 22%, transparent); color:currentColor; transition:transform .55s var(--ease); }
+    .button-orb svg { width:16px; height:16px; stroke:currentColor; stroke-width:2; fill:none; stroke-linecap:round; stroke-linejoin:round; }
     button:hover .button-orb { transform:translateX(2px) translateY(-1px); }
-    .ghost { background:rgba(255,255,255,.62); color:var(--ink); border:1px solid rgba(16,20,24,.12); box-shadow:none; }
-    .hero-panel { align-self:end; border-radius:28px; padding:8px; background:rgba(16,20,24,.06); box-shadow:var(--shadow); }
-    .hero-core { border-radius:22px; background:rgba(255,255,255,.86); padding:22px; min-height:360px; display:grid; align-content:space-between; box-shadow:inset 0 1px 0 rgba(255,255,255,.86); }
-    .scanline { display:flex; justify-content:space-between; gap:16px; padding:14px 0; border-bottom:1px solid rgba(16,20,24,.09); }
+    .secondary { background:var(--surface); color:var(--primary-strong); border:1px solid var(--line); box-shadow:var(--shadow-soft); }
+    .ghost { background:transparent; color:var(--ink); border:1px solid var(--line); box-shadow:none; }
+    .hero-panel { align-self:end; border-radius:24px; padding:7px; background:color-mix(in srgb, var(--ink) 7%, transparent); box-shadow:var(--shadow); }
+    .hero-core { border-radius:18px; background:color-mix(in srgb, var(--surface) 92%, transparent); padding:18px; min-height:330px; display:grid; align-content:space-between; box-shadow:inset 0 1px 0 rgba(255,255,255,.22); }
+    .scanline { display:flex; justify-content:space-between; gap:16px; padding:12px 0; border-bottom:1px solid color-mix(in srgb, var(--line) 80%, transparent); }
     .scanline:last-child { border-bottom:0; }
     .scanline strong { display:block; font-size:26px; font-variant-numeric:tabular-nums; }
     .scanline span { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.12em; }
     main { padding:8px 0 64px; }
-    .section-head { display:flex; align-items:end; justify-content:space-between; gap:18px; margin:24px 0 16px; }
-    h2 { margin:0; font-size:clamp(24px,3vw,42px); line-height:1; letter-spacing:0; }
+    .section-head { display:flex; align-items:end; justify-content:space-between; gap:18px; margin:22px 0 12px; scroll-margin-top:84px; }
+    h2 { margin:0; font-size:clamp(20px,2vw,28px); line-height:1.12; letter-spacing:0; }
     .muted { color: var(--muted); }
     .toolbar { display:grid; grid-template-columns:minmax(240px,1fr) 170px 210px 170px; gap:12px; align-items:center; margin:16px 0; }
     input, select { width:100%; padding:0 14px; }
     .page-controls { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin:0 0 12px; color:var(--muted); font-size:13px; }
     .page-actions { display:flex; gap:10px; flex-wrap:wrap; }
     .metrics { display:grid; grid-template-columns:repeat(4,minmax(140px,1fr)); gap:12px; }
-    .metric { border-radius:24px; padding:7px; background:rgba(16,20,24,.055); animation:rise .8s var(--ease) both; }
-    .metric-inner { min-height:126px; border-radius:18px; background:rgba(255,255,255,.86); padding:18px; box-shadow:inset 0 1px 0 rgba(255,255,255,.9); }
+    .metric { border-radius:18px; padding:0; background:var(--surface); border:1px solid var(--line); box-shadow:var(--shadow-soft); animation:rise .8s var(--ease) both; }
+    .metric-inner { min-height:104px; border-radius:18px; background:linear-gradient(180deg, color-mix(in srgb, var(--surface) 92%, transparent), color-mix(in srgb, var(--surface-2) 80%, transparent)); padding:16px; box-shadow:inset 0 1px 0 rgba(255,255,255,.18); }
     .metric strong { display:block; font-size:clamp(30px,4vw,54px); line-height:.9; font-variant-numeric:tabular-nums; }
     .metric span { display:block; margin-top:14px; color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.14em; }
     .repos { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:14px; margin-bottom:34px; }
-    .repo { border-radius:24px; padding:7px; background:rgba(16,20,24,.055); animation:rise .8s var(--ease) both; }
-    .repo-core { min-height:154px; border-radius:18px; background:rgba(255,255,255,.86); padding:18px; box-shadow:inset 0 1px 0 rgba(255,255,255,.9); }
+    .repo { border-radius:14px; padding:0; background:var(--surface); border:1px solid var(--line); box-shadow:none; animation:rise .8s var(--ease) both; transition:transform .45s var(--ease), box-shadow .45s var(--ease); }
+    .repo:hover { transform:translateY(-2px); box-shadow:var(--shadow-soft); }
+    .repo-core { min-height:132px; border-radius:14px; background:var(--surface); padding:14px; box-shadow:none; }
     .repo h3 { display:flex; align-items:center; justify-content:space-between; gap:10px; margin:0 0 14px; font-size:16px; }
     .repo p { margin:8px 0 0; color:var(--muted); font-size:13px; line-height:1.45; overflow-wrap:anywhere; }
     .families { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:12px; margin:0 0 34px; }
-    .family { border-radius:22px; padding:16px; background:rgba(255,255,255,.82); border:1px solid rgba(16,20,24,.08); box-shadow:inset 0 1px 0 rgba(255,255,255,.9); }
+    .family { border-radius:16px; padding:14px; background:var(--surface); border:1px solid var(--line); box-shadow:var(--shadow-soft); }
     .family h3 { display:flex; align-items:center; gap:9px; margin:0 0 10px; font-size:15px; }
     .family-dot { width:10px; height:10px; border-radius:999px; background:var(--accent); }
     .family[data-family*="Alma"] .family-dot { background:var(--alma); }
@@ -1384,48 +1393,52 @@ def dashboard_html() -> str:
     .family dt { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.11em; }
     .family dd { margin:2px 0 0; font-size:22px; font-weight:760; font-variant-numeric:tabular-nums; }
     .version-strip { display:flex; flex-wrap:wrap; gap:6px; margin-top:14px; }
-    .version-pill { display:inline-flex; align-items:center; min-height:28px; border-radius:999px; padding:4px 9px; background:rgba(16,20,24,.07); color:#27333d; font-size:12px; font-weight:740; }
+    .version-pill { display:inline-flex; align-items:center; min-height:26px; border-radius:999px; padding:4px 9px; background:var(--neutral-bg); color:var(--ink); font-size:12px; font-weight:740; }
     .security-grid { display:grid; grid-template-columns:minmax(280px,.85fr) minmax(360px,1.15fr); gap:14px; margin:0 0 34px; }
-    .security-panel { border-radius:22px; padding:18px; background:rgba(255,255,255,.84); border:1px solid rgba(16,20,24,.08); box-shadow:inset 0 1px 0 rgba(255,255,255,.9); }
-    .security-panel h3 { margin:8px 0 0; font-size:clamp(28px,4vw,52px); line-height:1; font-variant-numeric:tabular-nums; }
-    .risk-meter { height:12px; border-radius:999px; overflow:hidden; background:rgba(16,20,24,.1); margin:18px 0 8px; }
-    .risk-meter span { display:block; height:100%; width:0; background:linear-gradient(90deg, var(--ok), var(--warn), var(--bad)); border-radius:999px; }
+    .security-panel { border-radius:18px; padding:16px; background:var(--surface); border:1px solid var(--line); box-shadow:var(--shadow-soft); }
+    .security-panel h3 { margin:8px 0 0; font-size:clamp(24px,3vw,38px); line-height:1; font-variant-numeric:tabular-nums; }
+    .risk-meter { height:12px; border-radius:999px; overflow:hidden; background:var(--neutral-bg); margin:18px 0 8px; }
+    .risk-meter span { display:block; height:100%; width:0; background:linear-gradient(90deg, var(--ok), var(--medium), var(--high), var(--critical)); border-radius:999px; }
     .risk-list { display:grid; gap:8px; margin-top:14px; }
-    .risk-item { display:grid; grid-template-columns:1fr auto; gap:10px; align-items:center; padding:10px 0; border-top:1px solid rgba(16,20,24,.08); }
+    .risk-item { display:grid; grid-template-columns:1fr auto; gap:10px; align-items:center; padding:9px 0; border-top:1px solid var(--line); }
     .risk-item strong { font-size:13px; overflow-wrap:anywhere; }
     .risk-item span { color:var(--muted); font-size:12px; text-align:right; }
     .scan-console { display:grid; grid-template-columns:minmax(280px,.9fr) minmax(360px,1.1fr); gap:14px; margin:0 0 34px; }
-    .scan-card, .remediation-card { border-radius:22px; padding:18px; background:rgba(255,255,255,.84); border:1px solid rgba(16,20,24,.08); box-shadow:inset 0 1px 0 rgba(255,255,255,.9); }
-    .scan-card h3, .remediation-card h3 { margin:8px 0 12px; font-size:clamp(24px,3vw,38px); line-height:1; }
+    .scan-card { border-radius:18px; padding:16px; background:var(--surface); border:1px solid var(--line); box-shadow:var(--shadow-soft); }
+    .remediation-card { border-radius:18px; padding:16px; background:linear-gradient(180deg, var(--surface), color-mix(in srgb, var(--primary-soft) 42%, var(--surface))); border:1px solid color-mix(in srgb, var(--primary) 18%, var(--line)); box-shadow:var(--shadow-soft); }
+    .scan-card h3, .remediation-card h3 { margin:8px 0 12px; font-size:clamp(22px,2.5vw,32px); line-height:1; }
     .scan-actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:16px; }
     .scan-history { display:grid; gap:8px; margin-top:14px; }
-    .scan-run { display:grid; grid-template-columns:auto 1fr auto; gap:10px; align-items:center; padding:10px 0; border-top:1px solid rgba(16,20,24,.08); }
-    .scan-run code { font-family:"SFMono-Regular", Consolas, ui-monospace, monospace; font-size:12px; color:#34424e; }
+    .scan-run { display:grid; grid-template-columns:auto 1fr auto; gap:10px; align-items:center; padding:9px 0; border-top:1px solid var(--line); }
+    .scan-run code { font-family:"SFMono-Regular", Consolas, ui-monospace, monospace; font-size:12px; color:var(--ink); }
     .remediation-list { display:grid; gap:10px; margin-top:14px; }
-    .remediation-item { padding:12px; border-radius:16px; background:rgba(16,20,24,.045); border:1px solid rgba(16,20,24,.07); }
+    .remediation-item { padding:11px; border-radius:13px; background:color-mix(in srgb, var(--surface-2) 76%, transparent); border:1px solid var(--line); }
     .remediation-item strong { display:block; margin-bottom:6px; }
     .remediation-item ol { margin:8px 0 0 18px; padding:0; color:#40505c; font-size:13px; line-height:1.5; }
     .package-brief { display:grid; gap:10px; margin-top:14px; }
-    .brief-row { padding:12px; border-radius:16px; background:rgba(10,111,100,.055); border:1px solid rgba(10,111,100,.1); }
-    .brief-row span { display:block; margin-bottom:5px; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.12em; }
+    .brief-row { padding:11px; border-radius:13px; background:color-mix(in srgb, var(--primary-soft) 50%, transparent); border:1px solid color-mix(in srgb, var(--primary) 18%, var(--line)); }
+    .brief-row span { display:block; margin-bottom:5px; color:var(--muted); font-size:12px; }
     .brief-row strong { display:block; line-height:1.35; }
-    .details-button { all:unset; cursor:pointer; color:var(--accent); font-weight:760; }
-    .details-button:focus-visible { outline:3px solid rgba(10,111,100,.22); outline-offset:3px; border-radius:8px; }
-    .badge { display:inline-flex; align-items:center; border-radius:999px; padding:5px 10px; font-size:12px; font-weight:720; text-transform:uppercase; letter-spacing:.08em; }
-    .passed { color:#063f27; background:rgba(8,116,67,.13); }
-    .review { color:#62440a; background:rgba(138,100,26,.16); }
-    .failed { color:#761d18; background:rgba(169,52,44,.14); }
-    .critical { color:#761d18; background:rgba(169,52,44,.18); }
-    .high { color:#62440a; background:rgba(138,100,26,.18); }
-    .medium { color:#27333d; background:rgba(64,74,85,.12); }
-    .none { color:#063f27; background:rgba(8,116,67,.11); }
-    .pending { color:#404a55; background:rgba(64,74,85,.12); }
+    .details-button { all:unset; cursor:pointer; color:var(--primary-strong); font-weight:760; }
+    .details-button:focus-visible { outline:3px solid color-mix(in srgb, var(--primary) 28%, transparent); outline-offset:3px; border-radius:8px; }
+    .badge { display:inline-flex; align-items:center; border-radius:999px; padding:4px 9px; font-size:11px; font-weight:760; text-transform:uppercase; letter-spacing:.06em; border:1px solid transparent; }
+    .passed { color:var(--ok); background:var(--ok-bg); border-color:color-mix(in srgb, var(--ok) 24%, transparent); }
+    .review { color:var(--medium); background:var(--medium-bg); border-color:color-mix(in srgb, var(--medium) 24%, transparent); }
+    .failed { color:var(--critical); background:var(--critical-bg); border-color:color-mix(in srgb, var(--critical) 24%, transparent); }
+    .critical { color:var(--critical); background:var(--critical-bg); border-color:color-mix(in srgb, var(--critical) 28%, transparent); }
+    .high { color:var(--high); background:var(--high-bg); border-color:color-mix(in srgb, var(--high) 28%, transparent); }
+    .medium { color:var(--medium); background:var(--medium-bg); border-color:color-mix(in srgb, var(--medium) 28%, transparent); }
+    .low, .none { color:var(--low); background:var(--low-bg); border-color:color-mix(in srgb, var(--low) 24%, transparent); }
+    .pending { color:var(--muted); background:var(--neutral-bg); border-color:var(--line); }
     .error { color: var(--bad); }
-    .table-shell { border-radius:28px; padding:8px; background:rgba(16,20,24,.06); box-shadow:var(--shadow); }
-    .table-wrap { border-radius:22px; overflow:auto; background:rgba(255,255,255,.9); max-height:720px; box-shadow:inset 0 1px 0 rgba(255,255,255,.86); }
+    .table-shell { border-radius:20px; padding:10px; background:color-mix(in srgb, var(--ink) 6%, transparent); box-shadow:var(--shadow); scroll-margin-top:90px; }
+    .table-wrap { border-radius:14px; overflow:auto; background:var(--surface); max-height:700px; box-shadow:inset 0 1px 0 rgba(255,255,255,.16); }
     table { width:100%; border-collapse:collapse; table-layout:fixed; min-width:1380px; }
-    th, td { border-bottom:1px solid rgba(16,20,24,.08); padding:15px 14px; text-align:left; vertical-align:top; font-size:13px; }
-    th { position:sticky; top:0; z-index:1; color:#34424e; background:rgba(255,255,255,.96); font-size:11px; text-transform:uppercase; letter-spacing:.13em; }
+    th, td { border-bottom:1px solid var(--line); padding:10px 12px; text-align:left; vertical-align:middle; font-size:13px; height:52px; }
+    th { position:sticky; top:0; z-index:2; color:var(--muted); background:var(--surface); font-size:12px; font-weight:760; text-transform:none; letter-spacing:0; }
+    th:first-child, td:first-child { position:sticky; left:0; z-index:3; background:var(--surface); box-shadow:8px 0 18px rgba(18,33,54,.06); }
+    th:first-child { z-index:4; }
+    td .truncate { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:100%; }
     td:nth-child(1) { width:14%; font-weight:750; }
     td:nth-child(2) { width:17%; overflow-wrap:anywhere; font-variant-numeric:tabular-nums; }
     td:nth-child(3) { width:11%; }
@@ -1433,14 +1446,15 @@ def dashboard_html() -> str:
     td:nth-child(5) { width:14%; }
     td:nth-child(6), td:nth-child(7), td:nth-child(8), td:nth-child(9) { width:8%; }
     td:nth-child(10), td:nth-child(11) { width:15%; }
-    tbody tr { transition:background .45s var(--ease); }
-    tbody tr:hover { background:rgba(10,111,100,.055); }
-    .skeleton { position:relative; overflow:hidden; border-radius:14px; background:rgba(16,20,24,.08); min-height:18px; }
+    tbody tr:nth-child(even) { background:color-mix(in srgb, var(--surface-2) 38%, transparent); }
+    tbody tr:nth-child(even) td:first-child { background:color-mix(in srgb, var(--surface-2) 38%, var(--surface)); }
+    tbody tr:hover, tbody tr:hover td:first-child { background:color-mix(in srgb, var(--primary-soft) 46%, var(--surface)); }
+    .skeleton { position:relative; overflow:hidden; border-radius:10px; background:var(--neutral-bg); min-height:18px; }
     .skeleton::after { content:""; position:absolute; inset:0; transform:translateX(-100%); background:linear-gradient(90deg, transparent, rgba(255,255,255,.75), transparent); animation:shimmer 1.2s infinite; }
     .state { width:min(420px, calc(100vw - 76px)); padding:34px; text-align:center; color:var(--muted); }
     .state strong { display:block; color:var(--ink); font-size:18px; margin-bottom:8px; }
     .package-cards { display:none; gap:12px; }
-    .package-card { border-radius:18px; padding:15px; background:rgba(255,255,255,.9); border:1px solid rgba(16,20,24,.08); box-shadow:inset 0 1px 0 rgba(255,255,255,.9); }
+    .package-card { border-radius:16px; padding:14px; background:var(--surface); border:1px solid var(--line); box-shadow:var(--shadow-soft); }
     .package-card h3 { margin:0 0 8px; font-size:17px; overflow-wrap:anywhere; }
     .package-meta { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0 10px; }
     .package-card dl { display:grid; gap:8px; margin:0; }
@@ -1453,6 +1467,8 @@ def dashboard_html() -> str:
     @media (max-width: 760px) {
       .page { padding:16px; }
       header { min-height:auto; grid-template-columns:1fr; padding-top:10px; }
+      .console-nav { top:8px; align-items:flex-start; flex-direction:column; }
+      .nav-links { width:100%; }
       .brandbar { align-items:flex-start; flex-wrap:wrap; margin-bottom:42px; }
       .brandbar .eyebrow { font-size:9px; }
       h1 { font-size:clamp(40px,14vw,56px); overflow-wrap:anywhere; }
@@ -1470,8 +1486,26 @@ def dashboard_html() -> str:
 <body>
   <a class="skip-link" href="#packages-table">Skip to packages</a>
   <div class="page">
+    <svg aria-hidden="true" width="0" height="0" style="position:absolute">
+      <symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.9-4M4 5v5h5"/><path d="M4 13a8 8 0 0 0 14.9 4M20 19v-5h-5"/></symbol>
+      <symbol id="icon-play" viewBox="0 0 24 24"><path d="M8 5v14l11-7Z"/></symbol>
+      <symbol id="icon-arrow" viewBox="0 0 24 24"><path d="M5 12h14"/><path d="m13 6 6 6-6 6"/></symbol>
+      <symbol id="icon-moon" viewBox="0 0 24 24"><path d="M20 15.5A8.5 8.5 0 0 1 8.5 4 7 7 0 1 0 20 15.5Z"/></symbol>
+      <symbol id="icon-chevron-left" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></symbol>
+      <symbol id="icon-chevron-right" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
+    </svg>
+    <nav class="console-nav" aria-label="Dashboard sections">
+      <div class="nav-links">
+        <a href="#overview">Overview</a>
+        <a href="#security-section">Security</a>
+        <a href="#scan-section">Scans</a>
+        <a href="#repo-section">Repositories</a>
+        <a href="#packages-table">Packages</a>
+      </div>
+      <button class="theme-toggle" id="theme-toggle" type="button">Dark mode <span class="button-orb" aria-hidden="true"><svg><use href="#icon-moon"></use></svg></span></button>
+    </nav>
     <header>
-      <section>
+      <section id="overview">
         <div class="brandbar">
           <div class="mark"><span class="mark-dot" aria-hidden="true"></span><span>pkgmng</span></div>
           <span class="eyebrow">APT + RHEL-family RPM control plane</span>
@@ -1480,23 +1514,23 @@ def dashboard_html() -> str:
         <h1>Package intelligence for Linux fleets.</h1>
         <p class="lede">Track Debian APT plus AlmaLinux, Rocky Linux, Oracle Linux, and Red Hat RPM repositories with security review signals from one production console.</p>
         <div class="hero-actions">
-          <button id="refresh">Refresh index <span class="button-orb" aria-hidden="true">+</span></button>
-          <button id="scan">Run scan <span class="button-orb" aria-hidden="true">!</span></button>
-          <button class="ghost" id="show-review">Review queue <span class="button-orb" aria-hidden="true">&gt;</span></button>
+          <button id="scan">Run scan <span class="button-orb" aria-hidden="true"><svg><use href="#icon-play"></use></svg></span></button>
+          <button class="secondary" id="refresh">Refresh index <span class="button-orb" aria-hidden="true"><svg><use href="#icon-refresh"></use></svg></span></button>
+          <button class="ghost" id="show-review">Review queue <span class="button-orb" aria-hidden="true"><svg><use href="#icon-arrow"></use></svg></span></button>
         </div>
       </section>
       <aside class="hero-panel" aria-label="Repository scan summary">
         <div class="hero-core" id="hero-summary">
-          <div class="scanline"><span>Indexed packages</span><strong>...</strong></div>
-          <div class="scanline"><span>Needs review</span><strong>...</strong></div>
-          <div class="scanline"><span>Failed checks</span><strong>...</strong></div>
+          <div class="scanline"><span>Indexed packages</span><strong><span class="skeleton"></span></strong></div>
+          <div class="scanline"><span>Needs review</span><strong><span class="skeleton"></span></strong></div>
+          <div class="scanline"><span>Failed checks</span><strong><span class="skeleton"></span></strong></div>
           <div class="scanline"><span>Refresh cadence</span><strong>6h</strong></div>
         </div>
       </aside>
     </header>
     <main id="content">
       <section class="metrics" id="metrics" aria-label="Package security totals"></section>
-      <div class="section-head">
+      <div class="section-head" id="security-section">
         <div>
           <div class="eyebrow">Security validation</div>
           <h2>All package checks</h2>
@@ -1504,7 +1538,7 @@ def dashboard_html() -> str:
         <p class="muted">Every indexed DEB and RPM record is scored for metadata integrity, trusted transport, update-channel context, package purpose, and operational impact.</p>
       </div>
       <section class="security-grid" id="security" aria-label="Package validation summary"></section>
-      <div class="section-head">
+      <div class="section-head" id="scan-section">
         <div>
           <div class="eyebrow">Scan operations</div>
           <h2>Scan runs and remediation</h2>
@@ -1515,7 +1549,7 @@ def dashboard_html() -> str:
         <article class="scan-card" id="scan-runs"></article>
         <article class="remediation-card" id="remediation"></article>
       </section>
-      <div class="section-head">
+      <div class="section-head" id="version-section">
         <div>
           <div class="eyebrow">RHEL-family coverage</div>
           <h2>Distribution lanes</h2>
@@ -1523,7 +1557,7 @@ def dashboard_html() -> str:
         <p class="muted">Each distribution lane keeps the latest five configured OS releases, capped to the public versions with reachable repository metadata.</p>
       </div>
       <section class="families" id="families" aria-label="Distribution family summary"></section>
-      <div class="section-head">
+      <div class="section-head" id="repo-section">
         <div>
           <div class="eyebrow">Repository sources</div>
           <h2>Mirror health</h2>
@@ -1556,8 +1590,8 @@ def dashboard_html() -> str:
         <div class="page-controls">
           <span id="page-info">Loading package results...</span>
           <div class="page-actions">
-            <button class="ghost" id="prev-page">Previous <span class="button-orb" aria-hidden="true">&lt;</span></button>
-            <button class="ghost" id="next-page">Next <span class="button-orb" aria-hidden="true">&gt;</span></button>
+            <button class="ghost" id="prev-page">Previous <span class="button-orb" aria-hidden="true"><svg><use href="#icon-chevron-left"></use></svg></span></button>
+            <button class="ghost" id="next-page">Next <span class="button-orb" aria-hidden="true"><svg><use href="#icon-chevron-right"></use></svg></span></button>
           </div>
         </div>
         <div class="table-wrap">
@@ -1579,6 +1613,12 @@ def dashboard_html() -> str:
     const esc = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const PAGE_LIMIT = 100;
     let currentOffset = 0;
+    const icon = (name) => `<span class="button-orb" aria-hidden="true"><svg><use href="#icon-${name}"></use></svg></span>`;
+    const setTheme = (theme) => {
+      document.documentElement.dataset.theme = theme;
+      localStorage.setItem('pkgmng-theme', theme);
+      $('theme-toggle').innerHTML = `${theme === 'dark' ? 'Light mode' : 'Dark mode'} ${icon('moon')}`;
+    };
     const skeletonRows = () => Array.from({length: 8}).map(() => '<tr><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td></tr>').join('');
     const skeletonCards = () => Array.from({length: 4}).map(() => '<article class="package-card"><div class="skeleton"></div><br><div class="skeleton"></div><br><div class="skeleton"></div></article>').join('');
     const statusClass = (value) => ['passed', 'review', 'failed', 'pending'].includes(value) ? value : 'pending';
@@ -1605,7 +1645,7 @@ def dashboard_html() -> str:
         $('security').innerHTML = `<article class="security-panel"><div class="eyebrow">Average risk</div><h3>${avgRisk.toFixed(1)} / 100</h3><div class="risk-meter"><span style="width:${avgRisk}%"></span></div><p class="muted">${n(securityTotals.total)} packages scanned, ${n(securityTotals.critical)} critical metadata failures, ${n(securityTotals.high)} high review signals.</p><div class="risk-list">${lanes || '<div class="risk-item"><strong>No scan data</strong><span>refresh index</span></div>'}</div></article><article class="security-panel"><div class="eyebrow">Highest risk packages</div><h3>Validation queue</h3><div class="risk-list">${topRisk || '<div class="risk-item"><strong>No packages need review</strong><span>clear</span></div>'}</div></article>`;
         const currentRun = scans.current || {};
         const history = (scans.runs || []).map(run => `<div class="scan-run"><span class="badge ${run.status === 'succeeded' ? 'passed' : run.status === 'running' ? 'pending' : run.status === 'degraded' ? 'review' : 'failed'}">${esc(run.status)}</span><div><code>#${esc(run.id)} ${esc(run.trigger)}</code><br><span class="muted">${esc(run.started_at)}${run.finished_at ? ' to ' + esc(run.finished_at) : ''}</span></div><span>${n(run.packages_total)} pkgs</span></div>`).join('');
-        $('scan-runs').innerHTML = `<div class="eyebrow">Current scan</div><h3>${currentRun.id ? '#' + esc(currentRun.id) : 'No scan yet'}</h3><p class="muted">${esc(currentRun.notes || 'Run a scan to validate package metadata and generate remediation guidance.')}</p><div class="scan-actions"><button id="run-scan-inline">Run scan <span class="button-orb" aria-hidden="true">!</span></button><button class="ghost" id="failed-inline">Failed only <span class="button-orb" aria-hidden="true">&gt;</span></button></div><div class="scan-history">${history || '<div class="scan-run"><span class="badge pending">pending</span><div><code>No runs recorded</code><br><span class="muted">Start with Run scan</span></div><span>0 pkgs</span></div>'}</div>`;
+        $('scan-runs').innerHTML = `<div class="eyebrow">Current scan</div><h3>${currentRun.id ? '#' + esc(currentRun.id) : 'No scan yet'}</h3><p class="muted">${esc(currentRun.notes || 'Run a scan to validate package metadata and generate remediation guidance.')}</p><div class="scan-actions"><button id="run-scan-inline">Run scan ${icon('play')}</button><button class="ghost" id="failed-inline">Failed only ${icon('arrow')}</button></div><div class="scan-history">${history || '<div class="scan-run"><span class="badge pending">pending</span><div><code>No runs recorded</code><br><span class="muted">Start with Run scan</span></div><span>0 pkgs</span></div>'}</div>`;
         const remediationRows = (security.top_risk || []).slice(0, 4).map(row => `<div class="remediation-item"><strong>${esc(row.package)} <span class="badge ${esc(row.security_severity)}">${esc(row.security_severity)}</span></strong><span class="muted">${esc(row.responsibility || row.category || 'Package intelligence')}</span><br><span class="muted">${esc(row.why_not_safe || (row.security_findings || []).join('; ') || 'manual review')}</span></div>`).join('');
         $('remediation').innerHTML = `<div class="eyebrow">Remediation queue</div><h3>${n(securityTotals.review + securityTotals.failed)} actions</h3><p class="muted">Open a package row to see the exact owner, priority, evidence, and fix steps for each failed or review check.</p><div class="remediation-list">${remediationRows || '<div class="remediation-item"><strong>No active remediation</strong><span class="muted">All current package checks passed.</span></div>'}</div>`;
         $('run-scan-inline').addEventListener('click', runScan);
@@ -1629,7 +1669,7 @@ def dashboard_html() -> str:
         $('page-info').textContent = `Showing ${n(start)}-${n(end)} of ${n(page.total)} matching packages`;
         $('prev-page').disabled = page.offset <= 0;
         $('next-page').disabled = !page.has_more;
-        $('packages').innerHTML = packages.packages.length ? packages.packages.map(p => `<tr><td><button class="details-button" data-package-id="${esc(p.id)}">${esc(p.package)}</button></td><td>${esc(p.version)}</td><td>${esc(p.repo_name)}<br><span class="muted">${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</span></td><td>${esc(p.architecture || 'n/a')}</td><td>${esc(p.category)}<br><span class="muted">${esc(p.responsibility)}</span></td><td>${esc((p.package_format || 'deb').toUpperCase())}<br><span class="muted">${esc((p.checksum_algorithm || '').toUpperCase())}</span></td><td><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span></td><td><span class="badge ${esc(p.security_severity || 'none')}">${esc(p.security_severity || 'none')}</span></td><td>${n(p.security_risk_score)}</td><td>${esc(p.why_not_safe || 'none')}</td><td class="muted">${esc(p.primary_purpose || (p.description || '').split('\\n')[0])}</td></tr>`).join('') : '<tr><td colspan="7"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></td><td colspan="4"></td></tr>';
+        $('packages').innerHTML = packages.packages.length ? packages.packages.map(p => `<tr><td><button class="details-button truncate" title="${esc(p.package)}" data-package-id="${esc(p.id)}">${esc(p.package)}</button></td><td><span class="truncate" title="${esc(p.version)}">${esc(p.version)}</span></td><td><span class="truncate" title="${esc(p.repo_name)}">${esc(p.repo_name)}</span><span class="muted truncate">${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</span></td><td>${esc(p.architecture || 'n/a')}</td><td><span class="truncate" title="${esc(p.category)}">${esc(p.category)}</span><span class="muted truncate" title="${esc(p.responsibility)}">${esc(p.responsibility)}</span></td><td>${esc((p.package_format || 'deb').toUpperCase())}<br><span class="muted">${esc((p.checksum_algorithm || '').toUpperCase())}</span></td><td><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span></td><td><span class="badge ${esc(p.security_severity || 'none')}">${esc(p.security_severity || 'none')}</span></td><td>${n(p.security_risk_score)}</td><td><span class="truncate" title="${esc(p.why_not_safe || 'none')}">${esc(p.why_not_safe || 'none')}</span></td><td class="muted"><span class="truncate" title="${esc(p.primary_purpose || (p.description || '').split('\\n')[0])}">${esc(p.primary_purpose || (p.description || '').split('\\n')[0])}</span></td></tr>`).join('') : '<tr><td colspan="7"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></td><td colspan="4"></td></tr>';
         $('package-cards').innerHTML = packages.packages.length ? packages.packages.map(p => `<article class="package-card"><h3><button class="details-button" data-package-id="${esc(p.id)}">${esc(p.package)}</button></h3><div class="package-meta"><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span><span class="badge ${esc(p.security_severity || 'none')}">${esc(p.security_severity || 'none')}</span><span class="badge pending">${esc(p.architecture || 'n/a')}</span><span class="badge pending">${esc((p.package_format || 'deb').toUpperCase())}</span></div><dl><div><dt>Version</dt><dd>${esc(p.version)}</dd></div><div><dt>Repo</dt><dd>${esc(p.repo_name)} · ${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</dd></div><div><dt>Responsible for</dt><dd>${esc(p.responsibility)}</dd></div><div><dt>Why unsafe</dt><dd>${esc(p.why_not_safe || 'none')}</dd></div><div><dt>Purpose</dt><dd>${esc(p.primary_purpose || (p.description || '').split('\\n')[0])}</dd></div></dl></article>`).join('') : '<article class="package-card"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></article>';
         document.querySelectorAll('.details-button').forEach(button => button.addEventListener('click', () => showPackage(button.dataset.packageId)));
       } catch (error) {
@@ -1639,10 +1679,10 @@ def dashboard_html() -> str:
     }
     async function runScan() {
       $('scan').disabled = true;
-      $('scan').innerHTML = 'Scanning <span class="button-orb" aria-hidden="true">...</span>';
+      $('scan').innerHTML = `Scanning ${icon('refresh')}`;
       await fetch('/api/scans', { method: 'POST' });
       $('scan').disabled = false;
-      $('scan').innerHTML = 'Run scan <span class="button-orb" aria-hidden="true">!</span>';
+      $('scan').innerHTML = `Run scan ${icon('play')}`;
       load();
     }
     async function showPackage(packageId) {
@@ -1651,7 +1691,7 @@ def dashboard_html() -> str:
       $('remediation').innerHTML = `<div class="eyebrow">Package intelligence</div><h3>${esc(p.package)}</h3><div class="package-brief"><div class="brief-row"><span>Responsible for</span><strong>${esc(p.responsibility)}</strong></div><div class="brief-row"><span>Package purpose</span><strong>${esc(p.primary_purpose)}</strong></div><div class="brief-row"><span>Why it is not safe</span><strong>${esc(p.why_not_safe)}</strong></div><div class="brief-row"><span>Internal owner lane</span><strong>${esc(p.operational_owner)}</strong></div><div class="brief-row"><span>Upstream maintainer from package metadata</span><strong>${esc(p.upstream_maintainer)}</strong></div><div class="brief-row"><span>Architecture</span><strong>${esc(p.architecture || 'n/a')}</strong></div><div class="brief-row"><span>Checksum algorithm</span><strong>${esc((p.checksum_algorithm || 'unknown').toUpperCase())}</strong></div><div class="brief-row"><span>Impact</span><strong>${esc(p.impact)}</strong></div></div><p class="muted">${esc(p.recommended_action)}</p><div class="remediation-list">${steps || '<div class="remediation-item"><strong>No remediation required</strong><span class="muted">This package currently passes validation.</span></div>'}</div>`;
       document.querySelector('.scan-console').scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
-    $('refresh').addEventListener('click', async () => { $('refresh').disabled = true; $('refresh').innerHTML = 'Refreshing <span class="button-orb" aria-hidden="true">...</span>'; await fetch('/api/refresh', { method: 'POST' }); $('refresh').disabled = false; $('refresh').innerHTML = 'Refresh index <span class="button-orb" aria-hidden="true">+</span>'; load(); });
+    $('refresh').addEventListener('click', async () => { $('refresh').disabled = true; $('refresh').innerHTML = `Refreshing ${icon('refresh')}`; await fetch('/api/refresh', { method: 'POST' }); $('refresh').disabled = false; $('refresh').innerHTML = `Refresh index ${icon('refresh')}`; load(); });
     $('scan').addEventListener('click', runScan);
     $('show-review').addEventListener('click', () => { $('status').value = 'review'; currentOffset = 0; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
     $('prev-page').addEventListener('click', () => { currentOffset = Math.max(0, currentOffset - PAGE_LIMIT); load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
@@ -1660,6 +1700,8 @@ def dashboard_html() -> str:
     $('status').addEventListener('change', () => { currentOffset = 0; load(); });
     $('family').addEventListener('change', () => { currentOffset = 0; load(); });
     $('version').addEventListener('change', () => { currentOffset = 0; load(); });
+    $('theme-toggle').addEventListener('click', () => setTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'));
+    setTheme(localStorage.getItem('pkgmng-theme') || 'light');
     load();
   </script>
 </body>
