@@ -475,6 +475,14 @@ Start sandbox preflight on demand:
 curl -X POST http://pkgmng.pkgmng.svc:8080/api/sandbox/scans
 ```
 
+Start sandbox preflight for only four selected package records:
+
+```bash
+curl -X POST http://pkgmng.pkgmng.svc:8080/api/sandbox/scans \
+  -H 'Content-Type: application/json' \
+  -d '{"package_ids":[101,102,103,104]}'
+```
+
 Check sandbox queue, totals, and operation logs:
 
 ```bash
@@ -485,6 +493,12 @@ Package detail with sandbox evidence:
 
 ```bash
 curl http://pkgmng.pkgmng.svc:8080/api/packages/<package-id>
+```
+
+Package-specific sandbox logs:
+
+```bash
+curl http://pkgmng.pkgmng.svc:8080/api/packages/<package-id>/sandbox/logs
 ```
 
 Paginated package inventory:
@@ -517,6 +531,15 @@ Use the Package intelligence table filter `Sandbox = Needs sandbox` to review `s
 - `sandbox_evidence`
 - `sandbox_next_action`
 
-In the UI, open **Sandbox** from the sticky navigation. Use **Start sandbox preflight** to queue an on-demand scan, **Refresh status** to reload the current queue state, and **Sandbox operation logs** to inspect the latest run status, trigger, package count, and failure note. If the button reports that another scan is already running, wait for that run to complete or for the stale-run watchdog to mark it failed.
+In the UI, open **Sandbox** from the sticky navigation. Use **Start sandbox preflight** to queue a full on-demand preflight, **Refresh status** to reload the current queue state, and **Sandbox operation logs** to inspect run status, trigger, package count, package verdicts, evidence, and failure notes. If the button reports that another scan is already running, wait for that run to complete or for the stale-run watchdog to mark it failed.
+
+For a small targeted run, select package rows in the Package intelligence table and click **Sandbox selected**. This is the right path when you only need to inspect a few packages, for example four RPM/DEB records from one repo. Targeted runs are limited to 20 package IDs per request so an operator cannot accidentally launch a full catalog backfill from the small-run control.
+
+Each targeted run creates two levels of log records:
+
+| Log level | Endpoint | Contents |
+|---|---|---|
+| Run history | `GET /api/sandbox/scans` | Targeted run id, trigger, status, target count, pass/review/fail totals, timestamps, and notes. |
+| Package evidence | `GET /api/packages/{id}/sandbox/logs` | Per-package status, verdict, next action, findings, evidence, repo, architecture, package format, and run id. |
 
 Do not run untrusted package payloads inside the `pkgmng` web pod. Dynamic sandboxing should use a disposable VM or tightly confined worker lane that can be destroyed after each package test.

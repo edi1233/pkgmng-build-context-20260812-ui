@@ -105,12 +105,14 @@ Sandbox evidence explains the package format, artifact path, source repository, 
 ## Scan and remediation workflow
 
 - `POST /api/scans` launches a repository refresh plus full package validation run with trigger `manual`.
-- `POST /api/sandbox/scans` queues the same validation pipeline with trigger `manual-sandbox`, making an on-demand sandbox preflight run explicit in history.
+- `POST /api/sandbox/scans` with no body queues the same validation pipeline with trigger `manual-sandbox`, making an on-demand sandbox preflight run explicit in history.
+- `POST /api/sandbox/scans` with `{"package_ids":[1,2,3,4]}` runs targeted sandbox preflight for only those selected RPM/DEB package records. Targeted runs are limited to 20 packages per request.
 - Scheduled refreshes record trigger `scheduled`; API refreshes record trigger `manual-refresh`.
 - `GET /api/scans` returns recent scan runs with status, trigger, repository health, total packages, pass/review/fail counts, and highest severity. It also marks orphaned `running` scans older than `SCAN_STALE_MINUTES` as failed.
-- `GET /api/sandbox/scans` returns the current run, derived operation logs, sandbox totals, and next-action guidance for the sandbox lane.
+- `GET /api/sandbox/scans` returns the current run, derived operation logs, targeted sandbox run history, package-level sandbox logs, sandbox totals, and next-action guidance for the sandbox lane.
 - `GET /api/packages/{id}` returns the package validation profile with remediation guidance.
-- The UI includes a scan operations panel, scan history, a remediation queue, package-row detail actions, and a Sandbox run queue with **Start sandbox preflight**, **Refresh status**, operation logs, and Pending/Needs sandbox/Blocked shortcuts.
+- `GET /api/packages/{id}/sandbox/logs` returns every targeted sandbox run log for that package, including status, verdict, evidence, findings, and next action.
+- The UI includes a scan operations panel, scan history, a remediation queue, package-row detail actions, row checkboxes, and a Sandbox run queue with **Start sandbox preflight**, **Sandbox selected**, **Refresh status**, operation logs, and Pending/Needs sandbox/Blocked shortcuts.
 - `GET /api/packages` supports `limit` and `offset` pagination and returns `page.total`, `page.returned`, `page.offset`, and `page.has_more`.
 - Package rows expose architecture and checksum algorithm so source/binary variants do not look like duplicates.
 - Package detail distinguishes the internal owner lane from the upstream maintainer recorded in package metadata.

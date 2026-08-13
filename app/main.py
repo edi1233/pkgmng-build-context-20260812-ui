@@ -280,9 +280,41 @@ def init_db() -> None:
               highest_severity TEXT NOT NULL DEFAULT 'none',
               notes TEXT
             );
+            CREATE TABLE IF NOT EXISTS sandbox_runs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              requested_at TEXT NOT NULL,
+              started_at TEXT,
+              finished_at TEXT,
+              status TEXT NOT NULL,
+              trigger TEXT NOT NULL,
+              target_count INTEGER NOT NULL DEFAULT 0,
+              package_ids TEXT NOT NULL DEFAULT '[]',
+              passed INTEGER NOT NULL DEFAULT 0,
+              review INTEGER NOT NULL DEFAULT 0,
+              failed INTEGER NOT NULL DEFAULT 0,
+              notes TEXT
+            );
+            CREATE TABLE IF NOT EXISTS sandbox_package_logs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              sandbox_run_id INTEGER NOT NULL,
+              package_id INTEGER NOT NULL,
+              package TEXT NOT NULL,
+              version TEXT NOT NULL,
+              architecture TEXT,
+              repo_name TEXT NOT NULL,
+              package_format TEXT NOT NULL,
+              status TEXT NOT NULL,
+              verdict TEXT NOT NULL,
+              next_action TEXT NOT NULL,
+              findings TEXT NOT NULL DEFAULT '[]',
+              evidence TEXT NOT NULL DEFAULT '[]',
+              created_at TEXT NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_packages_name ON packages(package);
             CREATE INDEX IF NOT EXISTS idx_packages_status ON packages(security_status);
             CREATE INDEX IF NOT EXISTS idx_scan_runs_started ON scan_runs(started_at);
+            CREATE INDEX IF NOT EXISTS idx_sandbox_runs_requested ON sandbox_runs(requested_at);
+            CREATE INDEX IF NOT EXISTS idx_sandbox_package_logs_package ON sandbox_package_logs(package_id, id);
             """
         )
         ensure_column(conn, "repos", "repo_type", "TEXT NOT NULL DEFAULT 'apt'")
@@ -1197,6 +1229,24 @@ async def api_scan(request: Request, x_pkgmng_token: str = Header(default="")) -
 @app.post("/api/sandbox/scans")
 async def api_sandbox_scan(request: Request, x_pkgmng_token: str = Header(default="")) -> JSONResponse:
     verify_action_request(request, x_pkgmng_token)
+    payload: dict[str, Any] = {}
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    package_ids = payload.get("package_ids") if isinstance(payload, dict) else None
+    if package_ids:
+        run = run_targeted_sandbox(package_ids, trigger="manual-sandbox-targeted")
+        return JSONResponse(
+            {
+                "status": run["status"],
+                "trigger": run["trigger"],
+                "sandbox_run_id": run["id"],
+                "target_count": run["target_count"],
+                "message": f"Sandbox preflight completed for {run['target_count']} selected packages.",
+            },
+            status_code=202,
+        )
     launch_refresh("manual-sandbox")
     return JSONResponse(
         {
@@ -1206,6 +1256,217 @@ async def api_sandbox_scan(request: Request, x_pkgmng_token: str = Header(defaul
         },
         status_code=202,
     )
+
+
+def normalize_package_ids(raw_ids: Any) -> list[int]:
+    if not isinstance(raw_ids, list):
+        raise HTTPException(status_code=400, detail="package_ids must be a JSON array")
+    ids: list[int] = []
+    for raw_id in raw_ids:
+        try:
+            package_id = int(raw_id)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="package_ids must contain integer package ids") from exc
+        if package_id <= 0:
+            raise HTTPException(status_code=400, detail="package_ids must contain positive integers")
+        if package_id not in ids:
+            ids.append(package_id)
+    if not ids:
+        raise HTTPException(status_code=400, detail="select at least one package")
+    if len(ids) > 20:
+        raise HTTPException(status_code=400, detail="targeted sandbox runs are limited to 20 packages")
+    return ids
+
+
+def sandbox_profile_from_package(row: sqlite3.Row) -> dict[str, Any]:
+    package = dict(row)
+    record = {
+        "Package": package.get("package") or "",
+        "Version": package.get("version") or "",
+        "Architecture": package.get("architecture") or "",
+        "Section": package.get("section") or "",
+        "Priority": package.get("priority") or "",
+        "Filename": package.get("filename") or "",
+        "Size": str(package.get("size") or ""),
+        "SHA256": package.get("sha256") or "",
+        "ChecksumType": package.get("checksum_algorithm") or "",
+        "Maintainer": package.get("maintainer") or "",
+        "Description": package.get("description") or "",
+        "PackageFormat": package.get("package_format") or "",
+    }
+    repo = Repo(
+        str(package["repo_name"]),
+        str(package.get("repo_type") or package.get("package_format") or "apt"),
+        str(package.get("base_url") or ""),
+        str(package.get("suite") or ""),
+        str(package.get("component") or ""),
+    )
+    profile = validate_package(record, repo)
+    return profile["sandbox"]
+
+
+def run_targeted_sandbox(raw_package_ids: Any, trigger: str = "manual-sandbox-targeted") -> dict[str, Any]:
+    package_ids = normalize_package_ids(raw_package_ids)
+    requested_at = now_iso()
+    with closing(connect_db()) as conn:
+        placeholders = ",".join("?" for _ in package_ids)
+        rows = [
+            row
+            for row in conn.execute(
+                f"""
+                SELECT packages.*, repos.repo_type, repos.base_url, repos.suite, repos.component
+                FROM packages
+                JOIN repos ON repos.name = packages.repo_name
+                WHERE packages.id IN ({placeholders})
+                ORDER BY packages.package COLLATE NOCASE, packages.version, packages.architecture
+                """,
+                package_ids,
+            )
+        ]
+        found_ids = {int(row["id"]) for row in rows}
+        missing = [package_id for package_id in package_ids if package_id not in found_ids]
+        if missing:
+            raise HTTPException(status_code=404, detail=f"package ids not found: {missing}")
+        cursor = conn.execute(
+            """
+            INSERT INTO sandbox_runs(requested_at, started_at, status, trigger, target_count, package_ids, notes)
+            VALUES (?, ?, 'running', ?, ?, ?, ?)
+            """,
+            (
+                requested_at,
+                requested_at,
+                trigger,
+                len(rows),
+                json.dumps(package_ids),
+                "Targeted sandbox metadata preflight started for selected packages.",
+            ),
+        )
+        run_id = int(cursor.lastrowid)
+        counts = {"passed": 0, "review": 0, "failed": 0}
+        for row in rows:
+            sandbox = sandbox_profile_from_package(row)
+            status = sandbox["status"]
+            counts[status] = counts.get(status, 0) + 1
+            findings = json.dumps(sandbox["findings"])
+            evidence = json.dumps(
+                [
+                    *sandbox["evidence"],
+                    "targeted sandbox preflight was requested by an operator for this package",
+                    "dynamic package execution is not performed inside the web pod",
+                ]
+            )
+            conn.execute(
+                """
+                UPDATE packages
+                SET sandbox_status = ?,
+                    sandbox_verdict = ?,
+                    sandbox_findings = ?,
+                    sandbox_evidence = ?,
+                    sandbox_next_action = ?
+                WHERE id = ?
+                """,
+                (status, sandbox["verdict"], findings, evidence, sandbox["next_action"], row["id"]),
+            )
+            conn.execute(
+                """
+                INSERT INTO sandbox_package_logs(
+                  sandbox_run_id, package_id, package, version, architecture, repo_name, package_format,
+                  status, verdict, next_action, findings, evidence, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    row["id"],
+                    row["package"],
+                    row["version"],
+                    row["architecture"],
+                    row["repo_name"],
+                    row["package_format"],
+                    status,
+                    sandbox["verdict"],
+                    sandbox["next_action"],
+                    findings,
+                    evidence,
+                    now_iso(),
+                ),
+            )
+        finished_at = now_iso()
+        conn.execute(
+            """
+            UPDATE sandbox_runs
+            SET status = 'succeeded',
+                finished_at = ?,
+                passed = ?,
+                review = ?,
+                failed = ?,
+                notes = ?
+            WHERE id = ?
+            """,
+            (
+                finished_at,
+                counts.get("passed", 0),
+                counts.get("review", 0),
+                counts.get("failed", 0),
+                f"Targeted sandbox preflight completed for {len(rows)} selected packages.",
+                run_id,
+            ),
+        )
+        conn.commit()
+    return {
+        "id": run_id,
+        "requested_at": requested_at,
+        "finished_at": finished_at,
+        "status": "succeeded",
+        "trigger": trigger,
+        "target_count": len(rows),
+        **counts,
+    }
+
+
+def sandbox_run_rows(conn: sqlite3.Connection, limit: int) -> list[dict[str, Any]]:
+    return [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT *
+            FROM sandbox_runs
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+    ]
+
+
+def sandbox_package_log_rows(conn: sqlite3.Connection, package_id: int | None = None, limit: int = 25) -> list[dict[str, Any]]:
+    if package_id is None:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM sandbox_package_logs
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+    else:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM sandbox_package_logs
+            WHERE package_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (package_id, limit),
+        )
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item["findings"] = json.loads(item.get("findings") or "[]")
+        item["evidence"] = json.loads(item.get("evidence") or "[]")
+        output.append(item)
+    return output
 
 
 def scan_log_entries(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1268,8 +1529,12 @@ def api_sandbox_scans(limit: int = Query(10, ge=1, le=50)) -> dict[str, Any]:
     payload = api_scans(limit)
     with closing(connect_db()) as conn:
         totals = security_totals(conn)
+        targeted_runs = sandbox_run_rows(conn, limit)
+        package_logs = sandbox_package_log_rows(conn, limit=limit)
     return {
         **payload,
+        "targeted_runs": targeted_runs,
+        "package_logs": package_logs,
         "sandbox": {
             "passed": totals["sandbox_passed"],
             "review": totals["sandbox_review"],
@@ -1278,6 +1543,24 @@ def api_sandbox_scans(limit: int = Query(10, ge=1, le=50)) -> dict[str, Any]:
             "next_action": "Start on-demand sandbox preflight after source edits, package refreshes, or remediation changes. Dynamic execution belongs in a disposable worker lane.",
         },
     }
+
+
+@app.get("/api/packages/{package_id}/sandbox/logs")
+def api_package_sandbox_logs(package_id: int, limit: int = Query(25, ge=1, le=100)) -> dict[str, Any]:
+    with closing(connect_db()) as conn:
+        package = conn.execute(
+            """
+            SELECT id, package, version, architecture, repo_name, package_format, sandbox_status,
+                   sandbox_verdict, sandbox_next_action
+            FROM packages
+            WHERE id = ?
+            """,
+            (package_id,),
+        ).fetchone()
+        if package is None:
+            raise HTTPException(status_code=404, detail="package not found")
+        logs = sandbox_package_log_rows(conn, package_id=package_id, limit=limit)
+    return {"package": dict(package), "logs": logs}
 
 
 @app.get("/api/repos")
@@ -1791,6 +2074,9 @@ def dashboard_html() -> str:
     .ops-entry { display:grid; grid-template-columns:auto 1fr; gap:10px; align-items:start; padding:10px; border-radius:13px; background:color-mix(in srgb, var(--surface-2) 66%, transparent); border:1px solid var(--line); }
     .ops-entry p { margin:3px 0 0; color:var(--muted); font-size:12px; line-height:1.45; }
     .ops-entry code { font-family:"SFMono-Regular", Consolas, ui-monospace, monospace; font-size:12px; color:var(--ink); }
+    .select-cell { text-align:center; }
+    .select-cell input { width:18px; height:18px; padding:0; accent-color:var(--primary); }
+    .selected-state { display:inline-flex; align-items:center; min-height:32px; padding:4px 10px; border-radius:999px; background:var(--primary-soft); color:var(--primary-strong); font-size:12px; font-weight:760; }
     .remediation-list { display:grid; gap:10px; margin-top:14px; }
     .remediation-item { padding:11px; border-radius:13px; background:color-mix(in srgb, var(--surface-2) 76%, transparent); border:1px solid var(--line); }
     .remediation-item strong { display:block; margin-bottom:6px; }
@@ -1813,7 +2099,7 @@ def dashboard_html() -> str:
     .error { color: var(--bad); }
     .table-shell { border-radius:20px; padding:10px; background:color-mix(in srgb, var(--ink) 6%, transparent); box-shadow:var(--shadow); scroll-margin-top:90px; }
     .table-wrap { border-radius:14px; overflow:auto; background:var(--surface); max-height:700px; box-shadow:inset 0 1px 0 rgba(255,255,255,.16); }
-    table { width:100%; border-collapse:collapse; table-layout:fixed; min-width:1480px; }
+    table { width:100%; border-collapse:collapse; table-layout:fixed; min-width:1580px; }
     th, td { border-bottom:1px solid var(--line); padding:10px 12px; text-align:left; vertical-align:middle; font-size:13px; height:52px; }
     th { position:sticky; top:0; z-index:2; color:var(--muted); background:var(--surface); font-size:12px; font-weight:760; text-transform:none; letter-spacing:0; }
     th:first-child, td:first-child { position:sticky; left:0; z-index:3; background:var(--surface); box-shadow:8px 0 18px rgba(18,33,54,.06); }
@@ -1831,13 +2117,14 @@ def dashboard_html() -> str:
     .insight-reader-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:10px; }
     .insight-reader h3 { margin:0; font-size:18px; }
     .insight-reader p { margin:0; line-height:1.55; color:var(--ink); white-space:pre-wrap; overflow-wrap:anywhere; }
-    td:nth-child(1) { width:14%; font-weight:750; }
-    td:nth-child(2) { width:17%; overflow-wrap:anywhere; font-variant-numeric:tabular-nums; }
-    td:nth-child(3) { width:11%; }
-    td:nth-child(4) { width:7%; }
-    td:nth-child(5) { width:14%; }
-    td:nth-child(6), td:nth-child(7), td:nth-child(8), td:nth-child(9), td:nth-child(10) { width:8%; }
-    td:nth-child(11), td:nth-child(12) { width:15%; }
+    td:nth-child(1) { width:4%; }
+    td:nth-child(2) { width:13%; font-weight:750; }
+    td:nth-child(3) { width:15%; overflow-wrap:anywhere; font-variant-numeric:tabular-nums; }
+    td:nth-child(4) { width:10%; }
+    td:nth-child(5) { width:6%; }
+    td:nth-child(6) { width:13%; }
+    td:nth-child(7), td:nth-child(8), td:nth-child(9), td:nth-child(10), td:nth-child(11) { width:7%; }
+    td:nth-child(12), td:nth-child(13) { width:14%; }
     tbody tr:nth-child(even) { background:color-mix(in srgb, var(--surface-2) 38%, transparent); }
     tbody tr:nth-child(even) td:first-child { background:color-mix(in srgb, var(--surface-2) 38%, var(--surface)); }
     tbody tr:hover, tbody tr:hover td:first-child { background:color-mix(in srgb, var(--primary-soft) 46%, var(--surface)); }
@@ -2088,7 +2375,7 @@ def dashboard_html() -> str:
         </aside>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Package</th><th>Version</th><th>Repo</th><th>Arch</th><th>Responsible for</th><th>Format</th><th>Status</th><th>Severity</th><th>Risk</th><th>Sandbox</th><th>Why unsafe</th><th>Purpose</th></tr></thead>
+            <thead><tr><th>Select</th><th>Package</th><th>Version</th><th>Repo</th><th>Arch</th><th>Responsible for</th><th>Format</th><th>Status</th><th>Severity</th><th>Risk</th><th>Sandbox</th><th>Why unsafe</th><th>Purpose</th></tr></thead>
             <tbody id="packages"></tbody>
           </table>
         </div>
@@ -2106,13 +2393,14 @@ def dashboard_html() -> str:
     const PAGE_LIMIT = 100;
     let currentOffset = 0;
     let editingSourceName = '';
+    const selectedPackageIds = new Set();
     const icon = (name) => `<span class="button-orb" aria-hidden="true"><svg><use href="#icon-${name}"></use></svg></span>`;
     const setTheme = (theme) => {
       document.documentElement.dataset.theme = theme;
       localStorage.setItem('pkgmng-theme', theme);
       $('theme-toggle').innerHTML = `${theme === 'dark' ? 'Light mode' : 'Dark mode'} ${icon('moon')}`;
     };
-    const skeletonRows = () => Array.from({length: 8}).map(() => '<tr><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td></tr>').join('');
+    const skeletonRows = () => Array.from({length: 8}).map(() => '<tr><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td></tr>').join('');
     const skeletonCards = () => Array.from({length: 4}).map(() => '<article class="package-card"><div class="skeleton"></div><br><div class="skeleton"></div><br><div class="skeleton"></div></article>').join('');
     const statusClass = (value) => ['passed', 'review', 'failed', 'pending'].includes(value) ? value : 'pending';
     const n = (value) => Number(value || 0).toLocaleString();
@@ -2190,10 +2478,14 @@ def dashboard_html() -> str:
         const sandboxTotals = sandboxOps.sandbox || {};
         const sandboxRunning = sandboxCurrent.status === 'running';
         const sandboxLogRows = (sandboxOps.logs || []).map(entry => `<div class="ops-entry"><span class="badge ${statusClass(entry.status)}">${esc(entry.status)}</span><div><code>#${esc(entry.run_id)} ${esc(entry.trigger || 'unknown')}</code><p>${esc(entry.message)}</p><p>${esc(entry.timestamp || 'no timestamp')}</p></div></div>`).join('');
-        $('sandbox-queue').innerHTML = `<div class="eyebrow">Sandbox run queue</div><h3>${sandboxRunning ? 'Sandbox scan running' : 'Ready for on-demand scan'}</h3><p class="muted">${sandboxRunning ? esc(sandboxCurrent.notes || 'The current sandbox preflight is recalculating package evidence.') : esc(sandboxTotals.next_action || 'Start sandbox preflight after source edits or remediation changes.')}</p><div class="risk-list"><div class="risk-item"><strong>Passed preflight</strong><span>${n(sandboxTotals.passed)}</span></div><div class="risk-item"><strong>Needs sandbox</strong><span>${n(sandboxTotals.review)}</span></div><div class="risk-item"><strong>Blocked</strong><span>${n(sandboxTotals.failed)}</span></div><div class="risk-item"><strong>Pending backfill</strong><span>${n(sandboxTotals.pending)}</span></div></div><div class="scan-actions"><button id="run-sandbox-inline">${sandboxRunning ? 'Scan running' : 'Start sandbox preflight'} ${icon(sandboxRunning ? 'refresh' : 'play')}</button><button class="ghost" id="sandbox-refresh-inline">Refresh status ${icon('refresh')}</button></div><p class="muted" id="sandbox-action-state" aria-live="polite"></p>`;
-        $('sandbox-logs').innerHTML = `<div class="eyebrow">Sandbox operation logs</div><h3>Queue and run history</h3><p class="muted">These logs are scan-run records from the platform database: queued/running/completed status, trigger label, package counts, and failure notes.</p><div class="scan-actions"><button class="ghost" id="sandbox-pending-inline">Pending ${icon('arrow')}</button><button class="ghost" id="sandbox-review-log-inline">Needs sandbox ${icon('arrow')}</button><button class="ghost" id="sandbox-failed-log-inline">Blocked ${icon('arrow')}</button></div><div class="ops-log">${sandboxLogRows || '<div class="ops-entry"><span class="badge pending">pending</span><div><code>No sandbox runs</code><p>Start sandbox preflight to create the first operation log.</p></div></div>'}</div>`;
+        const targetedRows = (sandboxOps.targeted_runs || []).map(run => `<div class="ops-entry"><span class="badge ${statusClass(run.status)}">${esc(run.status)}</span><div><code>target #${esc(run.id)} ${esc(run.trigger)}</code><p>${n(run.target_count)} selected packages: ${n(run.passed)} passed, ${n(run.review)} need sandbox, ${n(run.failed)} blocked.</p><p>${esc(run.finished_at || run.started_at || run.requested_at)}</p></div></div>`).join('');
+        const packageLogRows = (sandboxOps.package_logs || []).map(log => `<div class="ops-entry"><span class="badge ${statusClass(log.status)}">${esc(log.status)}</span><div><code>${esc(log.package)} ${esc(log.version)} ${esc(log.architecture || '')}</code><p>${esc(log.verdict)} - ${esc(log.next_action)}</p><p>repo ${esc(log.repo_name)} · run #${esc(log.sandbox_run_id)}</p></div></div>`).join('');
+        $('sandbox-queue').innerHTML = `<div class="eyebrow">Sandbox run queue</div><h3>${sandboxRunning ? 'Sandbox scan running' : 'Ready for on-demand scan'}</h3><p class="muted">${sandboxRunning ? esc(sandboxCurrent.notes || 'The current sandbox preflight is recalculating package evidence.') : esc(sandboxTotals.next_action || 'Start sandbox preflight after source edits or remediation changes.')}</p><div class="risk-list"><div class="risk-item"><strong>Passed preflight</strong><span>${n(sandboxTotals.passed)}</span></div><div class="risk-item"><strong>Needs sandbox</strong><span>${n(sandboxTotals.review)}</span></div><div class="risk-item"><strong>Blocked</strong><span>${n(sandboxTotals.failed)}</span></div><div class="risk-item"><strong>Pending backfill</strong><span>${n(sandboxTotals.pending)}</span></div></div><div class="scan-actions"><button id="run-sandbox-inline">${sandboxRunning ? 'Scan running' : 'Start sandbox preflight'} ${icon(sandboxRunning ? 'refresh' : 'play')}</button><button class="secondary" id="run-selected-sandbox-inline">Sandbox selected ${icon('play')}</button><button class="ghost" id="clear-selected-inline">Clear selected ${icon('refresh')}</button><button class="ghost" id="sandbox-refresh-inline">Refresh status ${icon('refresh')}</button><span class="selected-state" id="selected-package-count">${n(selectedPackageIds.size)} selected</span></div><p class="muted" id="sandbox-action-state" aria-live="polite">Select up to 20 package rows to sandbox only those RPM/DEB records.</p>`;
+        $('sandbox-logs').innerHTML = `<div class="eyebrow">Sandbox operation logs</div><h3>Queue, targeted runs, and package evidence</h3><p class="muted">Logs include full scan-run records plus targeted package sandbox records: status, verdict, evidence, and next action for each selected package.</p><div class="scan-actions"><button class="ghost" id="sandbox-pending-inline">Pending ${icon('arrow')}</button><button class="ghost" id="sandbox-review-log-inline">Needs sandbox ${icon('arrow')}</button><button class="ghost" id="sandbox-failed-log-inline">Blocked ${icon('arrow')}</button></div><div class="ops-log">${targetedRows || packageLogRows || sandboxLogRows || '<div class="ops-entry"><span class="badge pending">pending</span><div><code>No sandbox runs</code><p>Start sandbox preflight or select package rows to create operation logs.</p></div></div>'}</div>`;
         $('run-sandbox-inline').disabled = sandboxRunning;
         $('run-sandbox-inline').addEventListener('click', runSandboxScan);
+        $('run-selected-sandbox-inline').addEventListener('click', runSelectedSandboxScan);
+        $('clear-selected-inline').addEventListener('click', () => { selectedPackageIds.clear(); load(); });
         $('sandbox-refresh-inline').addEventListener('click', load);
         $('sandbox-pending-inline').addEventListener('click', () => { $('sandbox-status').value = 'pending'; currentOffset = 0; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
         $('sandbox-review-log-inline').addEventListener('click', () => { $('sandbox-status').value = 'review'; currentOffset = 0; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
@@ -2236,9 +2528,23 @@ def dashboard_html() -> str:
         renderFilterSummary(page);
         $('prev-page').disabled = page.offset <= 0;
         $('next-page').disabled = !page.has_more;
-        $('packages').innerHTML = packages.packages.length ? packages.packages.map(p => `<tr><td><button class="details-button truncate" title="${esc(p.package)}" data-package-id="${esc(p.id)}">${esc(p.package)}</button></td><td><span class="truncate" title="${esc(p.version)}">${esc(p.version)}</span></td><td><span class="truncate" title="${esc(p.repo_name)}">${esc(p.repo_name)}</span><span class="muted truncate">${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</span></td><td>${esc(p.architecture || 'n/a')}</td><td><span class="truncate" title="${esc(p.category)}">${esc(p.category)}</span><span class="muted truncate" title="${esc(p.responsibility)}">${esc(p.responsibility)}</span></td><td>${esc((p.package_format || 'deb').toUpperCase())}<br><span class="muted">${esc((p.checksum_algorithm || '').toUpperCase())}</span></td><td><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span></td><td><span class="badge ${esc(p.security_severity || 'none')}">${esc(p.security_severity || 'none')}</span></td><td>${n(p.security_risk_score)}</td><td><span class="badge ${statusClass(p.sandbox_status)}">${esc(p.sandbox_status || 'pending')}</span><br><span class="muted truncate" title="${esc(p.sandbox_verdict)}">${esc(p.sandbox_verdict || 'not scanned')}</span></td><td>${insightCell(p.why_not_safe || 'none', 'unsafe reason')}</td><td class="muted">${insightCell(p.primary_purpose || (p.description || '').split('\\n')[0], 'package purpose')}</td></tr>`).join('') : '<tr><td colspan="8"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></td><td colspan="4"></td></tr>';
+        $('packages').innerHTML = packages.packages.length ? packages.packages.map(p => `<tr><td class="select-cell"><input type="checkbox" class="package-select" data-package-id="${esc(p.id)}" aria-label="Select ${esc(p.package)} for targeted sandbox" ${selectedPackageIds.has(String(p.id)) ? 'checked' : ''}></td><td><button class="details-button truncate" title="${esc(p.package)}" data-package-id="${esc(p.id)}">${esc(p.package)}</button><button class="insight-toggle sandbox-one" type="button" data-package-id="${esc(p.id)}">Sandbox this</button></td><td><span class="truncate" title="${esc(p.version)}">${esc(p.version)}</span></td><td><span class="truncate" title="${esc(p.repo_name)}">${esc(p.repo_name)}</span><span class="muted truncate">${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</span></td><td>${esc(p.architecture || 'n/a')}</td><td><span class="truncate" title="${esc(p.category)}">${esc(p.category)}</span><span class="muted truncate" title="${esc(p.responsibility)}">${esc(p.responsibility)}</span></td><td>${esc((p.package_format || 'deb').toUpperCase())}<br><span class="muted">${esc((p.checksum_algorithm || '').toUpperCase())}</span></td><td><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span></td><td><span class="badge ${esc(p.security_severity || 'none')}">${esc(p.security_severity || 'none')}</span></td><td>${n(p.security_risk_score)}</td><td><span class="badge ${statusClass(p.sandbox_status)}">${esc(p.sandbox_status || 'pending')}</span><br><span class="muted truncate" title="${esc(p.sandbox_verdict)}">${esc(p.sandbox_verdict || 'not scanned')}</span></td><td>${insightCell(p.why_not_safe || 'none', 'unsafe reason')}</td><td class="muted">${insightCell(p.primary_purpose || (p.description || '').split('\\n')[0], 'package purpose')}</td></tr>`).join('') : '<tr><td colspan="13"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></td></tr>';
         $('package-cards').innerHTML = packages.packages.length ? packages.packages.map(p => `<article class="package-card"><h3><button class="details-button" data-package-id="${esc(p.id)}">${esc(p.package)}</button></h3><div class="package-meta"><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span><span class="badge ${esc(p.security_severity || 'none')}">${esc(p.security_severity || 'none')}</span><span class="badge ${statusClass(p.sandbox_status)}">sandbox ${esc(p.sandbox_status || 'pending')}</span><span class="badge pending">${esc(p.architecture || 'n/a')}</span><span class="badge pending">${esc((p.package_format || 'deb').toUpperCase())}</span></div><dl><div><dt>Version</dt><dd>${esc(p.version)}</dd></div><div><dt>Repo</dt><dd>${esc(p.repo_name)} · ${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</dd></div><div><dt>Responsible for</dt><dd>${esc(p.responsibility)}</dd></div><div><dt>Sandbox verdict</dt><dd>${esc(p.sandbox_verdict || 'not scanned')}</dd></div><div><dt>Why unsafe</dt><dd>${insightCell(p.why_not_safe || 'none', 'unsafe reason')}</dd></div><div><dt>Purpose</dt><dd>${insightCell(p.primary_purpose || (p.description || '').split('\\n')[0], 'package purpose')}</dd></div></dl></article>`).join('') : '<article class="package-card"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></article>';
         document.querySelectorAll('.details-button').forEach(button => button.addEventListener('click', () => showPackage(button.dataset.packageId)));
+        document.querySelectorAll('.package-select').forEach(input => input.addEventListener('change', () => {
+          if (input.checked) {
+            if (selectedPackageIds.size >= 20) {
+              input.checked = false;
+              $('sandbox-action-state').textContent = 'Targeted sandbox runs are limited to 20 packages.';
+              return;
+            }
+            selectedPackageIds.add(String(input.dataset.packageId));
+          } else {
+            selectedPackageIds.delete(String(input.dataset.packageId));
+          }
+          $('selected-package-count').textContent = `${n(selectedPackageIds.size)} selected`;
+        }));
+        document.querySelectorAll('.sandbox-one').forEach(button => button.addEventListener('click', () => runTargetedSandbox([button.dataset.packageId])));
         document.querySelectorAll('.insight-expand').forEach(button => button.addEventListener('click', () => {
           const cell = button.closest('.insight-cell');
           const expanded = cell.dataset.expanded === 'true';
@@ -2253,7 +2559,7 @@ def dashboard_html() -> str:
           $('insight-reader').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
         }));
       } catch (error) {
-        $('packages').innerHTML = `<tr><td colspan="12"><div class="state error"><strong>Could not load package data</strong>${esc(error.message || error)}</div></td></tr>`;
+        $('packages').innerHTML = `<tr><td colspan="13"><div class="state error"><strong>Could not load package data</strong>${esc(error.message || error)}</div></td></tr>`;
         $('package-cards').innerHTML = `<article class="package-card"><div class="state error"><strong>Could not load package data</strong>${esc(error.message || error)}</div></article>`;
       }
     }
@@ -2295,12 +2601,50 @@ def dashboard_html() -> str:
         setTimeout(load, 900);
       }
     }
+    async function runTargetedSandbox(packageIds) {
+      const ids = [...new Set(packageIds.map(id => String(id)).filter(Boolean))];
+      const state = $('sandbox-action-state');
+      if (!ids.length) {
+        state.textContent = 'Select one to 20 packages before starting a targeted sandbox run.';
+        return;
+      }
+      if (ids.length > 20) {
+        state.textContent = 'Targeted sandbox runs are limited to 20 packages.';
+        return;
+      }
+      state.textContent = `Requesting targeted sandbox preflight for ${n(ids.length)} packages...`;
+      try {
+        const response = await fetch('/api/sandbox/scans', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ package_ids: ids.map(id => Number(id)) })
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(body.detail || body.error || `Targeted sandbox failed with HTTP ${response.status}`);
+        }
+        state.textContent = body.message || 'Targeted sandbox preflight completed.';
+        ids.forEach(id => selectedPackageIds.delete(id));
+      } catch (error) {
+        state.textContent = error.message || String(error);
+      } finally {
+        setTimeout(load, 900);
+      }
+    }
+    async function runSelectedSandboxScan() {
+      await runTargetedSandbox([...selectedPackageIds]);
+    }
     async function showPackage(packageId) {
-      const p = await fetch('/api/packages/' + encodeURIComponent(packageId)).then(r => r.json());
+      const [p, logPayload] = await Promise.all([
+        fetch('/api/packages/' + encodeURIComponent(packageId)).then(r => r.json()),
+        fetch('/api/packages/' + encodeURIComponent(packageId) + '/sandbox/logs').then(r => r.json())
+      ]);
       const steps = (p.remediation || []).map(item => `<div class="remediation-item"><strong>${esc(item.action)} <span class="badge ${esc(item.priority === 'urgent' ? 'critical' : item.priority === 'high' ? 'high' : 'medium')}">${esc(item.priority)}</span></strong><span class="muted">${esc(item.owner)} - ${esc(item.evidence || '')}</span><ol>${(item.steps || []).map(step => `<li>${esc(step)}</li>`).join('')}</ol></div>`).join('');
       const sandboxEvidence = (p.sandbox_evidence || []).map(item => `<li>${esc(item)}</li>`).join('');
       const sandboxFindings = (p.sandbox_findings || []).map(item => `<li>${esc(item)}</li>`).join('');
-      $('remediation').innerHTML = `<div class="eyebrow">Package intelligence</div><h3>${esc(p.package)}</h3><div class="package-brief"><div class="brief-row"><span>Responsible for</span><strong>${esc(p.responsibility)}</strong></div><div class="brief-row"><span>Package purpose</span><strong>${esc(p.primary_purpose)}</strong></div><div class="brief-row"><span>Why it is not safe</span><strong>${esc(p.why_not_safe)}</strong></div><div class="brief-row"><span>Sandbox verdict</span><strong><span class="badge ${statusClass(p.sandbox_status)}">${esc(p.sandbox_status || 'pending')}</span> ${esc(p.sandbox_verdict || 'not scanned')}</strong></div><div class="brief-row"><span>Sandbox next action</span><strong>${esc(p.sandbox_next_action || 'No sandbox action recorded.')}</strong></div><div class="brief-row"><span>Internal owner lane</span><strong>${esc(p.operational_owner)}</strong></div><div class="brief-row"><span>Upstream maintainer from package metadata</span><strong>${esc(p.upstream_maintainer)}</strong></div><div class="brief-row"><span>Architecture</span><strong>${esc(p.architecture || 'n/a')}</strong></div><div class="brief-row"><span>Checksum algorithm</span><strong>${esc((p.checksum_algorithm || 'unknown').toUpperCase())}</strong></div><div class="brief-row"><span>Impact</span><strong>${esc(p.impact)}</strong></div></div><p class="muted">${esc(p.recommended_action)}</p><div class="remediation-list"><div class="remediation-item"><strong>Sandbox evidence</strong><ol>${sandboxEvidence || '<li>No sandbox evidence recorded.</li>'}</ol>${sandboxFindings ? `<strong>Sandbox findings</strong><ol>${sandboxFindings}</ol>` : ''}</div>${steps || '<div class="remediation-item"><strong>No remediation required</strong><span class="muted">This package currently passes validation.</span></div>'}</div>`;
+      const packageLogs = (logPayload.logs || []).map(log => `<div class="remediation-item"><strong>Run #${esc(log.sandbox_run_id)} <span class="badge ${statusClass(log.status)}">${esc(log.status)}</span></strong><span class="muted">${esc(log.created_at)} - ${esc(log.verdict)}</span><ol>${(log.evidence || []).map(item => `<li>${esc(item)}</li>`).join('')}</ol></div>`).join('');
+      $('remediation').innerHTML = `<div class="eyebrow">Package intelligence</div><h3>${esc(p.package)}</h3><div class="scan-actions"><button id="sandbox-package-detail">Sandbox this package ${icon('play')}</button></div><div class="package-brief"><div class="brief-row"><span>Responsible for</span><strong>${esc(p.responsibility)}</strong></div><div class="brief-row"><span>Package purpose</span><strong>${esc(p.primary_purpose)}</strong></div><div class="brief-row"><span>Why it is not safe</span><strong>${esc(p.why_not_safe)}</strong></div><div class="brief-row"><span>Sandbox verdict</span><strong><span class="badge ${statusClass(p.sandbox_status)}">${esc(p.sandbox_status || 'pending')}</span> ${esc(p.sandbox_verdict || 'not scanned')}</strong></div><div class="brief-row"><span>Sandbox next action</span><strong>${esc(p.sandbox_next_action || 'No sandbox action recorded.')}</strong></div><div class="brief-row"><span>Internal owner lane</span><strong>${esc(p.operational_owner)}</strong></div><div class="brief-row"><span>Upstream maintainer from package metadata</span><strong>${esc(p.upstream_maintainer)}</strong></div><div class="brief-row"><span>Architecture</span><strong>${esc(p.architecture || 'n/a')}</strong></div><div class="brief-row"><span>Checksum algorithm</span><strong>${esc((p.checksum_algorithm || 'unknown').toUpperCase())}</strong></div><div class="brief-row"><span>Impact</span><strong>${esc(p.impact)}</strong></div></div><p class="muted">${esc(p.recommended_action)}</p><div class="remediation-list"><div class="remediation-item"><strong>Sandbox evidence</strong><ol>${sandboxEvidence || '<li>No sandbox evidence recorded.</li>'}</ol>${sandboxFindings ? `<strong>Sandbox findings</strong><ol>${sandboxFindings}</ol>` : ''}</div><div class="remediation-item"><strong>Sandbox package logs</strong><span class="muted">Every targeted run for this package is retained here.</span></div>${packageLogs || '<div class="remediation-item"><strong>No targeted package logs yet</strong><span class="muted">Use Sandbox this package to create the first per-package log.</span></div>'}${steps || '<div class="remediation-item"><strong>No remediation required</strong><span class="muted">This package currently passes validation.</span></div>'}</div>`;
+      $('sandbox-package-detail').addEventListener('click', () => runTargetedSandbox([packageId]));
       document.querySelector('.scan-console').scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
     function editSource(repo) {
