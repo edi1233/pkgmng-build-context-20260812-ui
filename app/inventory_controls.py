@@ -114,50 +114,7 @@ def patch_dashboard() -> None:
     original_dashboard = main.dashboard_html
 
     def dashboard_html() -> str:
-        html = original_dashboard()
-        html = html.replace(
-            ".toolbar { display:grid; grid-template-columns:minmax(240px,1fr) 160px 190px 160px 210px; gap:12px; align-items:center; margin:16px 0; }",
-            ".toolbar-panel { margin:16px 0; padding:12px; border-radius:18px; background:var(--surface); border:1px solid var(--line); box-shadow:var(--shadow-soft); }"
-            ".toolbar-panel-head { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; margin-bottom:12px; }"
-            ".toolbar-panel-head h3 { margin:2px 0 4px; font-size:18px; } .toolbar-panel-head p { margin:0; font-size:13px; }"
-            ".toolbar { display:grid; grid-template-columns:minmax(240px,1.4fr) repeat(4,minmax(145px,1fr)); gap:10px; align-items:end; margin:0; }"
-            ".filter-field { display:grid; gap:6px; color:var(--muted); font-size:12px; font-weight:720; }"
-            ".filter-actions { display:flex; gap:8px; justify-content:flex-end; flex-wrap:wrap; }"
-            ".filter-summary { display:flex; flex-wrap:wrap; gap:7px; margin-top:12px; min-height:26px; }"
-            ".filter-chip { display:inline-flex; align-items:center; min-height:26px; border-radius:999px; padding:4px 9px; background:var(--neutral-bg); color:var(--ink); border:1px solid var(--line); font-size:12px; font-weight:720; }",
-        )
-        html = html.replace(
-            '<div class="toolbar" role="search">',
-            '<div class="toolbar-panel" role="search" aria-label="Package inventory controls"><div class="toolbar-panel-head"><div><div class="eyebrow">Inventory controls</div><h3>Filter every package field</h3><p class="muted">Combine status, severity, source, OS lane, architecture, format, checksum, and sort order.</p></div><div class="filter-actions"><button class="secondary" id="reset-filters" type="button">Reset filters <span class="button-orb" aria-hidden="true"><svg><use href="#icon-refresh"></use></svg></span></button></div></div><div class="toolbar">',
-        )
-        html = html.replace('<input id="q" aria-label="Search packages" placeholder="Search package, maintainer, description">', '<div class="filter-field"><label for="q">Search</label><input id="q" aria-label="Search packages" placeholder="Package, maintainer, description"></div>')
-        html = html.replace('<select id="status" aria-label="Filter by security status">', '<div class="filter-field"><label for="status">Status</label><select id="status" aria-label="Filter by security status">')
-        html = html.replace('</select>\n        <select id="family"', '</select></div><div class="filter-field"><label for="severity">Severity</label><select id="severity" aria-label="Filter by security severity"><option value="">All severities</option><option value="critical">Critical</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option><option value="none">None</option></select></div><div class="filter-field"><label for="family">Distribution</label><select id="family"', 1)
-        html = html.replace('</select>\n        <select id="version"', '</select></div><div class="filter-field"><label for="version">OS version</label><select id="version"', 1)
-        html = html.replace('</select>\n        <select id="repo-filter"', '</select></div><div class="filter-field"><label for="repo-filter">Repository</label><select id="repo-filter"', 1)
-        html = html.replace('        </select>\n      </div>\n      <section class="table-shell"', '        </select></div><div class="filter-field"><label for="format">Format</label><select id="format" aria-label="Filter by package format"><option value="">All formats</option><option value="deb">DEB</option><option value="rpm">RPM</option></select></div><div class="filter-field"><label for="architecture">Architecture</label><select id="architecture" aria-label="Filter by package architecture"><option value="">All architectures</option></select></div><div class="filter-field"><label for="checksum">Checksum</label><select id="checksum" aria-label="Filter by checksum algorithm"><option value="">All checksums</option></select></div><div class="filter-field"><label for="sort">Sort by</label><select id="sort" aria-label="Sort packages"><option value="risk">Risk first</option><option value="severity">Severity</option><option value="status">Status</option><option value="package">Package name</option><option value="repo">Repository</option><option value="version">Version</option><option value="updated">Last refresh</option></select></div></div><div class="filter-summary" id="filter-summary" aria-live="polite"></div></div>\n      <section class="table-shell"', 1)
-        html = html.replace(
-            "const n = (value) => Number(value || 0).toLocaleString();",
-            "const n = (value) => Number(value || 0).toLocaleString(); const filterIds = ['status','severity','family','version','repo-filter','format','architecture','checksum','sort']; const selectedFilters = () => ({ q: $('q').value.trim(), status: $('status').value, severity: $('severity').value, family: $('family').value, version: $('version').value, repo: $('repo-filter').value, package_format: $('format').value, architecture: $('architecture').value, checksum_algorithm: $('checksum').value, sort: $('sort').value }); const setSelectOptions = (id, placeholder, values, current, formatter = (value) => value) => { const options = [...new Set((values || []).filter(Boolean))]; $(id).innerHTML = `<option value=\"\">${placeholder}</option>` + options.map(value => `<option value=\"${esc(value)}\">${esc(formatter(value))}</option>`).join(''); $(id).value = options.includes(current) ? current : ''; }; const renderFilterSummary = (page) => { const filters = selectedFilters(); const labels = [['Search', filters.q], ['Status', filters.status], ['Severity', filters.severity], ['Family', filters.family], ['OS', filters.version], ['Repo', filters.repo], ['Format', filters.package_format ? filters.package_format.toUpperCase() : ''], ['Arch', filters.architecture], ['Checksum', filters.checksum_algorithm ? filters.checksum_algorithm.toUpperCase() : ''], ['Sort', $('sort').selectedOptions[0]?.textContent || 'Risk first']].filter(([, value]) => value); $('filter-summary').innerHTML = labels.map(([key, value]) => `<span class=\"filter-chip\">${esc(key)}: ${esc(value)}</span>`).join('') + `<span class=\"filter-chip\">${n(page.total || 0)} matches</span>`; };",
-        )
-        html = html.replace(
-            "const params = new URLSearchParams({ q: $('q').value, status: $('status').value, family: $('family').value, version: $('version').value, repo: $('repo-filter').value, limit: String(PAGE_LIMIT), offset: String(currentOffset) });",
-            "const params = new URLSearchParams({ ...selectedFilters(), limit: String(PAGE_LIMIT), offset: String(currentOffset) });",
-        )
-        html = html.replace(
-            "$('version').value = versionOptions.includes(versionValue) ? versionValue : '';",
-            "$('version').value = versionOptions.includes(versionValue) ? versionValue : ''; const filterOptions = packages.filter_options || {}; setSelectOptions('architecture', 'All architectures', filterOptions.architectures || [], $('architecture').value); setSelectOptions('checksum', 'All checksums', filterOptions.checksum_algorithms || [], $('checksum').value, value => value.toUpperCase());",
-        )
-        html = html.replace("$('page-info').textContent = `Showing ${n(start)}-${n(end)} of ${n(page.total)} matching packages`;", "$('page-info').textContent = `Showing ${n(start)}-${n(end)} of ${n(page.total)} matching packages`; renderFilterSummary(page);")
-        html = html.replace(
-            "    async function saveSource(event) {",
-            "    function resetFilters() { $('q').value = ''; $('status').value = ''; $('severity').value = ''; $('family').value = ''; $('version').value = ''; $('repo-filter').value = ''; $('format').value = ''; $('architecture').value = ''; $('checksum').value = ''; $('sort').value = 'risk'; currentOffset = 0; load(); }\n    async function saveSource(event) {",
-        )
-        html = html.replace(
-            "$('status').addEventListener('change', () => { currentOffset = 0; load(); });\n    $('family').addEventListener('change', () => { currentOffset = 0; load(); });\n    $('version').addEventListener('change', () => { currentOffset = 0; load(); });\n    $('repo-filter').addEventListener('change', () => { currentOffset = 0; load(); });",
-            "filterIds.forEach(id => $(id).addEventListener('change', () => { currentOffset = 0; load(); }));\n    $('reset-filters').addEventListener('click', resetFilters);",
-        )
-        return html
+        return original_dashboard()
 
     main.dashboard_html = dashboard_html
     main.index = dashboard_html
