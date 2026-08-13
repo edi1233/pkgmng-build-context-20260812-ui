@@ -255,6 +255,11 @@ def init_db() -> None:
               security_severity TEXT NOT NULL DEFAULT 'none',
               security_risk_score INTEGER NOT NULL DEFAULT 0,
               security_checks TEXT NOT NULL DEFAULT '[]',
+              sandbox_status TEXT NOT NULL DEFAULT 'pending',
+              sandbox_verdict TEXT NOT NULL DEFAULT '',
+              sandbox_findings TEXT NOT NULL DEFAULT '[]',
+              sandbox_evidence TEXT NOT NULL DEFAULT '[]',
+              sandbox_next_action TEXT NOT NULL DEFAULT '',
               refreshed_at TEXT NOT NULL,
               UNIQUE(repo_name, package, version, architecture)
             );
@@ -287,6 +292,11 @@ def init_db() -> None:
         ensure_column(conn, "packages", "security_severity", "TEXT NOT NULL DEFAULT 'none'")
         ensure_column(conn, "packages", "security_risk_score", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "packages", "security_checks", "TEXT NOT NULL DEFAULT '[]'")
+        ensure_column(conn, "packages", "sandbox_status", "TEXT NOT NULL DEFAULT 'pending'")
+        ensure_column(conn, "packages", "sandbox_verdict", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "packages", "sandbox_findings", "TEXT NOT NULL DEFAULT '[]'")
+        ensure_column(conn, "packages", "sandbox_evidence", "TEXT NOT NULL DEFAULT '[]'")
+        ensure_column(conn, "packages", "sandbox_next_action", "TEXT NOT NULL DEFAULT ''")
         for repo in configured_repos():
             upsert_repo_source(conn, repo, reset_status=False)
         conn.commit()
@@ -602,6 +612,7 @@ def validate_package(record: dict[str, Any], repo: Repo | None = None) -> dict[s
     findings = [check["detail"] for check in checks if check["status"] != "passed"]
     remediation = [check["remediation"] for check in checks if check["status"] != "passed"]
     risk_score = sum({"none": 0, "low": 5, "medium": 15, "high": 30, "critical": 60}.get(check["severity"], 0) for check in checks)
+    sandbox = sandbox_assessment(record, checks, repo)
     return {
         "status": status,
         "severity": severity,
@@ -609,6 +620,66 @@ def validate_package(record: dict[str, Any], repo: Repo | None = None) -> dict[s
         "findings": findings,
         "remediation": remediation,
         "checks": checks,
+        "sandbox": sandbox,
+    }
+
+
+def sandbox_assessment(record: dict[str, Any], checks: list[dict[str, Any]], repo: Repo | None = None) -> dict[str, Any]:
+    package_format = str(record.get("PackageFormat", repo.repo_type if repo else "deb") or "deb").lower()
+    filename = str(record.get("Filename", "") or "")
+    name = str(record.get("Package", "") or "")
+    description = str(record.get("Description", "") or "")
+    section = str(record.get("Section", "") or "")
+    failed_checks = [check for check in checks if check.get("status") == "failed"]
+    review_checks = [check for check in checks if check.get("status") == "review"]
+    evidence = [
+        f"artifact format: {package_format.upper()}",
+        f"artifact path: {filename or 'not declared'}",
+    ]
+    if repo:
+        evidence.append(f"source repo: {repo.name} ({repo.distro_family} {repo.release_version or repo.component})")
+    findings: list[str] = []
+
+    if failed_checks:
+        findings.extend(check.get("detail", "") for check in failed_checks if check.get("detail"))
+        return {
+            "status": "failed",
+            "verdict": "sandbox blocked before execution",
+            "findings": findings or ["failed metadata checks prevent trusted sandbox execution"],
+            "evidence": evidence,
+            "next_action": "Quarantine the package until identity, type, checksum, and size metadata are valid. Do not execute it in a sandbox yet because the artifact cannot be trusted.",
+        }
+
+    high_impact_ids = {"priority", "sensitive_section", "privileged_behavior", "advisory_signal"}
+    high_impact = [check for check in review_checks if check.get("id") in high_impact_ids]
+    if high_impact:
+        findings.extend(check.get("detail", "") for check in high_impact if check.get("detail"))
+        evidence.append("dynamic behavior sandbox required before production promotion")
+        return {
+            "status": "review",
+            "verdict": "dynamic sandbox required",
+            "findings": findings,
+            "evidence": evidence,
+            "next_action": "Run the package in an isolated disposable host lane and inspect install scripts, file writes, service changes, network access, capabilities, and privileged execution before promotion.",
+        }
+
+    if re.search(r"\b(postinst|preinst|postrm|preun|scriptlet|systemd|daemon|service|setuid|kernel|module)\b", f"{name} {section} {description}", re.I):
+        findings.append("package metadata suggests install-time behavior that should be observed in a sandbox")
+        evidence.append("install-time behavior keyword detected in metadata")
+        return {
+            "status": "review",
+            "verdict": "sandbox observation recommended",
+            "findings": findings,
+            "evidence": evidence,
+            "next_action": "Observe install and remove behavior in a sandbox before broad rollout, then attach the result to the package record.",
+        }
+
+    return {
+        "status": "passed",
+        "verdict": "metadata preflight passed",
+        "findings": [],
+        "evidence": [*evidence, "no sandbox risk trigger detected from repository metadata"],
+        "next_action": "Eligible for normal mirror consumption; keep under scheduled scan cadence.",
     }
 
 
@@ -859,8 +930,10 @@ async def refresh_repo(repo: Repo) -> dict[str, Any]:
                       repo_name, package, version, architecture, section, priority,
                       filename, size, sha256, checksum_algorithm, maintainer, description,
                       package_format, security_status, security_findings,
-                      security_severity, security_risk_score, security_checks, refreshed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      security_severity, security_risk_score, security_checks,
+                      sandbox_status, sandbox_verdict, sandbox_findings, sandbox_evidence, sandbox_next_action,
+                      refreshed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         repo.name,
@@ -881,6 +954,11 @@ async def refresh_repo(repo: Repo) -> dict[str, Any]:
                         profile["severity"],
                         profile["risk_score"],
                         json.dumps(profile["checks"]),
+                        profile["sandbox"]["status"],
+                        profile["sandbox"]["verdict"],
+                        json.dumps(profile["sandbox"]["findings"]),
+                        json.dumps(profile["sandbox"]["evidence"]),
+                        profile["sandbox"]["next_action"],
                         refreshed_at,
                     ),
                 )
@@ -916,6 +994,9 @@ def security_totals(conn: sqlite3.Connection) -> dict[str, Any]:
               COALESCE(SUM(security_severity='critical'), 0) critical,
               COALESCE(SUM(security_severity='high'), 0) high,
               COALESCE(SUM(security_severity='medium'), 0) medium,
+              COALESCE(SUM(sandbox_status='passed'), 0) sandbox_passed,
+              COALESCE(SUM(sandbox_status='review'), 0) sandbox_review,
+              COALESCE(SUM(sandbox_status='failed'), 0) sandbox_failed,
               COALESCE(ROUND(AVG(security_risk_score), 1), 0) avg_risk
             FROM packages
             """
@@ -1154,6 +1235,7 @@ def api_repo_packages(
         q="",
         status="",
         severity="",
+        sandbox_status="",
         family="",
         version="",
         repo=repo_name,
@@ -1323,6 +1405,7 @@ def api_packages(
     q: str = "",
     status: str = Query("", pattern="^(|passed|review|failed)$"),
     severity: str = Query("", pattern="^(|none|low|medium|high|critical)$"),
+    sandbox_status: str = Query("", pattern="^(|passed|review|failed|pending)$"),
     family: str = "",
     version: str = "",
     repo: str = "",
@@ -1344,6 +1427,9 @@ def api_packages(
     if severity:
         where.append("security_severity = ?")
         args.append(severity)
+    if sandbox_status:
+        where.append("sandbox_status = ?")
+        args.append(sandbox_status)
     if family:
         where.append("repos.distro_family = ?")
         args.append(family)
@@ -1393,6 +1479,8 @@ def api_packages(
         for row in rows:
             row["security_findings"] = json.loads(row["security_findings"])
             row["security_checks"] = json.loads(row["security_checks"])
+            row["sandbox_findings"] = json.loads(row.get("sandbox_findings") or "[]")
+            row["sandbox_evidence"] = json.loads(row.get("sandbox_evidence") or "[]")
             row["checksum_algorithm"] = row.get("checksum_algorithm") or detect_checksum_algorithm(str(row.get("sha256") or ""))
             row.update(package_intelligence(row))
         totals = dict(
@@ -1402,7 +1490,10 @@ def api_packages(
                   COUNT(*) total,
                   COALESCE(SUM(security_status='passed'), 0) passed,
                   COALESCE(SUM(security_status='review'), 0) review,
-                  COALESCE(SUM(security_status='failed'), 0) failed
+                  COALESCE(SUM(security_status='failed'), 0) failed,
+                  COALESCE(SUM(sandbox_status='passed'), 0) sandbox_passed,
+                  COALESCE(SUM(sandbox_status='review'), 0) sandbox_review,
+                  COALESCE(SUM(sandbox_status='failed'), 0) sandbox_failed
                 FROM packages
                 """
             ).fetchone()
@@ -1452,6 +1543,8 @@ def api_package(package_id: int) -> dict[str, Any]:
     item = dict(row)
     item["security_findings"] = json.loads(item["security_findings"])
     item["security_checks"] = json.loads(item["security_checks"])
+    item["sandbox_findings"] = json.loads(item.get("sandbox_findings") or "[]")
+    item["sandbox_evidence"] = json.loads(item.get("sandbox_evidence") or "[]")
     item["checksum_algorithm"] = item.get("checksum_algorithm") or detect_checksum_algorithm(str(item.get("sha256") or ""))
     item.update(package_intelligence(item))
     item["remediation"] = [
@@ -1613,7 +1706,7 @@ def dashboard_html() -> str:
     .error { color: var(--bad); }
     .table-shell { border-radius:20px; padding:10px; background:color-mix(in srgb, var(--ink) 6%, transparent); box-shadow:var(--shadow); scroll-margin-top:90px; }
     .table-wrap { border-radius:14px; overflow:auto; background:var(--surface); max-height:700px; box-shadow:inset 0 1px 0 rgba(255,255,255,.16); }
-    table { width:100%; border-collapse:collapse; table-layout:fixed; min-width:1380px; }
+    table { width:100%; border-collapse:collapse; table-layout:fixed; min-width:1480px; }
     th, td { border-bottom:1px solid var(--line); padding:10px 12px; text-align:left; vertical-align:middle; font-size:13px; height:52px; }
     th { position:sticky; top:0; z-index:2; color:var(--muted); background:var(--surface); font-size:12px; font-weight:760; text-transform:none; letter-spacing:0; }
     th:first-child, td:first-child { position:sticky; left:0; z-index:3; background:var(--surface); box-shadow:8px 0 18px rgba(18,33,54,.06); }
@@ -1636,8 +1729,8 @@ def dashboard_html() -> str:
     td:nth-child(3) { width:11%; }
     td:nth-child(4) { width:7%; }
     td:nth-child(5) { width:14%; }
-    td:nth-child(6), td:nth-child(7), td:nth-child(8), td:nth-child(9) { width:8%; }
-    td:nth-child(10), td:nth-child(11) { width:15%; }
+    td:nth-child(6), td:nth-child(7), td:nth-child(8), td:nth-child(9), td:nth-child(10) { width:8%; }
+    td:nth-child(11), td:nth-child(12) { width:15%; }
     tbody tr:nth-child(even) { background:color-mix(in srgb, var(--surface-2) 38%, transparent); }
     tbody tr:nth-child(even) td:first-child { background:color-mix(in srgb, var(--surface-2) 38%, var(--surface)); }
     tbody tr:hover, tbody tr:hover td:first-child { background:color-mix(in srgb, var(--primary-soft) 46%, var(--surface)); }
@@ -1695,6 +1788,7 @@ def dashboard_html() -> str:
         <a href="#overview">Overview</a>
         <a href="#security-section">Security</a>
         <a href="#scan-section">Scans</a>
+        <a href="#sandbox-section">Sandbox</a>
         <a href="#source-section">Sources</a>
         <a href="#repo-section">Repositories</a>
         <a href="#packages-table">Packages</a>
@@ -1732,9 +1826,17 @@ def dashboard_html() -> str:
           <div class="eyebrow">Security validation</div>
           <h2>All package checks</h2>
         </div>
-        <p class="muted">Every indexed DEB and RPM record is scored for metadata integrity, trusted transport, update-channel context, package purpose, and operational impact.</p>
+        <p class="muted">Every indexed DEB and RPM record is scored for metadata integrity, trusted transport, sandbox preflight, package purpose, and operational impact.</p>
       </div>
       <section class="security-grid" id="security" aria-label="Package validation summary"></section>
+      <div class="section-head" id="sandbox-section">
+        <div>
+          <div class="eyebrow">Sandbox validation</div>
+          <h2>Package behavior safety</h2>
+        </div>
+        <p class="muted">Sandbox status separates packages eligible for normal consumption, packages that need dynamic install observation, and packages blocked before execution because identity metadata is not trustworthy.</p>
+      </div>
+      <section class="security-grid" id="sandbox-summary" aria-label="Sandbox validation summary"></section>
       <div class="section-head" id="scan-section">
         <div>
           <div class="eyebrow">Scan operations</div>
@@ -1818,6 +1920,13 @@ def dashboard_html() -> str:
             <option value="low">Low</option>
             <option value="none">None</option>
           </select></div>
+          <div class="filter-field"><label for="sandbox-status">Sandbox</label><select id="sandbox-status" aria-label="Filter by sandbox status">
+            <option value="">All sandbox states</option>
+            <option value="failed">Blocked</option>
+            <option value="review">Needs sandbox</option>
+            <option value="passed">Passed preflight</option>
+            <option value="pending">Pending</option>
+          </select></div>
           <div class="filter-field"><label for="family">Distribution</label><select id="family" aria-label="Filter by distribution family">
             <option value="">All families</option>
           </select></div>
@@ -1867,7 +1976,7 @@ def dashboard_html() -> str:
         </aside>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Package</th><th>Version</th><th>Repo</th><th>Arch</th><th>Responsible for</th><th>Format</th><th>Status</th><th>Severity</th><th>Risk</th><th>Why unsafe</th><th>Purpose</th></tr></thead>
+            <thead><tr><th>Package</th><th>Version</th><th>Repo</th><th>Arch</th><th>Responsible for</th><th>Format</th><th>Status</th><th>Severity</th><th>Risk</th><th>Sandbox</th><th>Why unsafe</th><th>Purpose</th></tr></thead>
             <tbody id="packages"></tbody>
           </table>
         </div>
@@ -1891,7 +2000,7 @@ def dashboard_html() -> str:
       localStorage.setItem('pkgmng-theme', theme);
       $('theme-toggle').innerHTML = `${theme === 'dark' ? 'Light mode' : 'Dark mode'} ${icon('moon')}`;
     };
-    const skeletonRows = () => Array.from({length: 8}).map(() => '<tr><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td></tr>').join('');
+    const skeletonRows = () => Array.from({length: 8}).map(() => '<tr><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td></tr>').join('');
     const skeletonCards = () => Array.from({length: 4}).map(() => '<article class="package-card"><div class="skeleton"></div><br><div class="skeleton"></div><br><div class="skeleton"></div></article>').join('');
     const statusClass = (value) => ['passed', 'review', 'failed', 'pending'].includes(value) ? value : 'pending';
     const n = (value) => Number(value || 0).toLocaleString();
@@ -1903,11 +2012,12 @@ def dashboard_html() -> str:
         : '';
       return `<div class="insight-cell" data-expanded="false"><span class="insight-text" title="${esc(value)}">${esc(value)}</span><div class="insight-actions">${needsToggle ? `<button class="insight-toggle insight-expand" type="button" aria-expanded="false" aria-label="Expand ${esc(label)} preview">Show more</button>` : ''}${readerButton}</div></div>`;
     };
-    const filterIds = ['q', 'status', 'severity', 'family', 'version', 'repo-filter', 'format', 'architecture', 'checksum', 'sort'];
+    const filterIds = ['q', 'status', 'severity', 'sandbox-status', 'family', 'version', 'repo-filter', 'format', 'architecture', 'checksum', 'sort'];
     const selectedFilters = () => ({
       q: $('q').value.trim(),
       status: $('status').value,
       severity: $('severity').value,
+      sandbox_status: $('sandbox-status').value,
       family: $('family').value,
       version: $('version').value,
       repo: $('repo-filter').value,
@@ -1927,6 +2037,7 @@ def dashboard_html() -> str:
         ['Search', filters.q],
         ['Status', filters.status],
         ['Severity', filters.severity],
+        ['Sandbox', filters.sandbox_status],
         ['Family', filters.family],
         ['OS', filters.version],
         ['Repo', filters.repo],
@@ -1960,6 +2071,9 @@ def dashboard_html() -> str:
         const lanes = (security.by_family || []).slice(0, 10).map(row => `<div class="risk-item"><strong>${esc(row.distro_family)} v${esc(row.release_version || 'n/a')}</strong><span>${n(row.review)} review / ${n(row.failed)} failed</span></div>`).join('');
         const topRisk = (security.top_risk || []).slice(0, 8).map(row => `<div class="risk-item"><strong>${esc(row.package)}</strong><span>${esc(row.security_severity)} - ${n(row.security_risk_score)} / ${n(row.affected_variants || 1)} variants</span></div>`).join('');
         $('security').innerHTML = `<article class="security-panel"><div class="eyebrow">Average risk</div><h3>${avgRisk.toFixed(1)} / 100</h3><div class="risk-meter"><span style="width:${avgRisk}%"></span></div><p class="muted">${n(securityTotals.total)} packages scanned, ${n(securityTotals.critical)} critical metadata failures, ${n(securityTotals.high)} high review signals.</p><div class="risk-list">${lanes || '<div class="risk-item"><strong>No scan data</strong><span>refresh index</span></div>'}</div></article><article class="security-panel"><div class="eyebrow">Highest risk packages</div><h3>Validation queue</h3><div class="risk-list">${topRisk || '<div class="risk-item"><strong>No packages need review</strong><span>clear</span></div>'}</div></article>`;
+        $('sandbox-summary').innerHTML = `<article class="security-panel"><div class="eyebrow">Sandbox preflight</div><h3>${n(securityTotals.sandbox_review + securityTotals.sandbox_failed)} need action</h3><div class="risk-list"><div class="risk-item"><strong>Passed preflight</strong><span>${n(securityTotals.sandbox_passed)}</span></div><div class="risk-item"><strong>Needs dynamic sandbox</strong><span>${n(securityTotals.sandbox_review)}</span></div><div class="risk-item"><strong>Blocked before execution</strong><span>${n(securityTotals.sandbox_failed)}</span></div></div></article><article class="security-panel"><div class="eyebrow">How to proceed</div><h3>Sandbox lane</h3><p class="muted">Passed packages can stay in normal monitoring. Review packages need disposable-host install/remove observation. Blocked packages must first fix checksum, size, or artifact identity before any execution.</p><div class="scan-actions"><button class="ghost" id="sandbox-review-inline">Needs sandbox ${icon('arrow')}</button><button class="ghost" id="sandbox-blocked-inline">Blocked ${icon('arrow')}</button></div></article>`;
+        $('sandbox-review-inline').addEventListener('click', () => { $('sandbox-status').value = 'review'; currentOffset = 0; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+        $('sandbox-blocked-inline').addEventListener('click', () => { $('sandbox-status').value = 'failed'; currentOffset = 0; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
         const currentRun = scans.current || {};
         const history = (scans.runs || []).map(run => `<div class="scan-run"><span class="badge ${run.status === 'succeeded' ? 'passed' : run.status === 'running' ? 'pending' : run.status === 'degraded' ? 'review' : 'failed'}">${esc(run.status)}</span><div><code>#${esc(run.id)} ${esc(run.trigger)}</code><br><span class="muted">${esc(run.started_at)}${run.finished_at ? ' to ' + esc(run.finished_at) : ''}</span></div><span>${n(run.packages_total)} pkgs</span></div>`).join('');
         $('scan-runs').innerHTML = `<div class="eyebrow">Current scan</div><h3>${currentRun.id ? '#' + esc(currentRun.id) : 'No scan yet'}</h3><p class="muted">${esc(currentRun.notes || 'Run a scan to validate package metadata and generate remediation guidance.')}</p><div class="scan-actions"><button id="run-scan-inline">Run scan ${icon('play')}</button><button class="ghost" id="failed-inline">Failed only ${icon('arrow')}</button></div><div class="scan-history">${history || '<div class="scan-run"><span class="badge pending">pending</span><div><code>No runs recorded</code><br><span class="muted">Start with Run scan</span></div><span>0 pkgs</span></div>'}</div>`;
@@ -1998,8 +2112,8 @@ def dashboard_html() -> str:
         renderFilterSummary(page);
         $('prev-page').disabled = page.offset <= 0;
         $('next-page').disabled = !page.has_more;
-        $('packages').innerHTML = packages.packages.length ? packages.packages.map(p => `<tr><td><button class="details-button truncate" title="${esc(p.package)}" data-package-id="${esc(p.id)}">${esc(p.package)}</button></td><td><span class="truncate" title="${esc(p.version)}">${esc(p.version)}</span></td><td><span class="truncate" title="${esc(p.repo_name)}">${esc(p.repo_name)}</span><span class="muted truncate">${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</span></td><td>${esc(p.architecture || 'n/a')}</td><td><span class="truncate" title="${esc(p.category)}">${esc(p.category)}</span><span class="muted truncate" title="${esc(p.responsibility)}">${esc(p.responsibility)}</span></td><td>${esc((p.package_format || 'deb').toUpperCase())}<br><span class="muted">${esc((p.checksum_algorithm || '').toUpperCase())}</span></td><td><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span></td><td><span class="badge ${esc(p.security_severity || 'none')}">${esc(p.security_severity || 'none')}</span></td><td>${n(p.security_risk_score)}</td><td>${insightCell(p.why_not_safe || 'none', 'unsafe reason')}</td><td class="muted">${insightCell(p.primary_purpose || (p.description || '').split('\\n')[0], 'package purpose')}</td></tr>`).join('') : '<tr><td colspan="7"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></td><td colspan="4"></td></tr>';
-        $('package-cards').innerHTML = packages.packages.length ? packages.packages.map(p => `<article class="package-card"><h3><button class="details-button" data-package-id="${esc(p.id)}">${esc(p.package)}</button></h3><div class="package-meta"><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span><span class="badge ${esc(p.security_severity || 'none')}">${esc(p.security_severity || 'none')}</span><span class="badge pending">${esc(p.architecture || 'n/a')}</span><span class="badge pending">${esc((p.package_format || 'deb').toUpperCase())}</span></div><dl><div><dt>Version</dt><dd>${esc(p.version)}</dd></div><div><dt>Repo</dt><dd>${esc(p.repo_name)} · ${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</dd></div><div><dt>Responsible for</dt><dd>${esc(p.responsibility)}</dd></div><div><dt>Why unsafe</dt><dd>${insightCell(p.why_not_safe || 'none', 'unsafe reason')}</dd></div><div><dt>Purpose</dt><dd>${insightCell(p.primary_purpose || (p.description || '').split('\\n')[0], 'package purpose')}</dd></div></dl></article>`).join('') : '<article class="package-card"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></article>';
+        $('packages').innerHTML = packages.packages.length ? packages.packages.map(p => `<tr><td><button class="details-button truncate" title="${esc(p.package)}" data-package-id="${esc(p.id)}">${esc(p.package)}</button></td><td><span class="truncate" title="${esc(p.version)}">${esc(p.version)}</span></td><td><span class="truncate" title="${esc(p.repo_name)}">${esc(p.repo_name)}</span><span class="muted truncate">${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</span></td><td>${esc(p.architecture || 'n/a')}</td><td><span class="truncate" title="${esc(p.category)}">${esc(p.category)}</span><span class="muted truncate" title="${esc(p.responsibility)}">${esc(p.responsibility)}</span></td><td>${esc((p.package_format || 'deb').toUpperCase())}<br><span class="muted">${esc((p.checksum_algorithm || '').toUpperCase())}</span></td><td><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span></td><td><span class="badge ${esc(p.security_severity || 'none')}">${esc(p.security_severity || 'none')}</span></td><td>${n(p.security_risk_score)}</td><td><span class="badge ${statusClass(p.sandbox_status)}">${esc(p.sandbox_status || 'pending')}</span><br><span class="muted truncate" title="${esc(p.sandbox_verdict)}">${esc(p.sandbox_verdict || 'not scanned')}</span></td><td>${insightCell(p.why_not_safe || 'none', 'unsafe reason')}</td><td class="muted">${insightCell(p.primary_purpose || (p.description || '').split('\\n')[0], 'package purpose')}</td></tr>`).join('') : '<tr><td colspan="8"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></td><td colspan="4"></td></tr>';
+        $('package-cards').innerHTML = packages.packages.length ? packages.packages.map(p => `<article class="package-card"><h3><button class="details-button" data-package-id="${esc(p.id)}">${esc(p.package)}</button></h3><div class="package-meta"><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span><span class="badge ${esc(p.security_severity || 'none')}">${esc(p.security_severity || 'none')}</span><span class="badge ${statusClass(p.sandbox_status)}">sandbox ${esc(p.sandbox_status || 'pending')}</span><span class="badge pending">${esc(p.architecture || 'n/a')}</span><span class="badge pending">${esc((p.package_format || 'deb').toUpperCase())}</span></div><dl><div><dt>Version</dt><dd>${esc(p.version)}</dd></div><div><dt>Repo</dt><dd>${esc(p.repo_name)} · ${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</dd></div><div><dt>Responsible for</dt><dd>${esc(p.responsibility)}</dd></div><div><dt>Sandbox verdict</dt><dd>${esc(p.sandbox_verdict || 'not scanned')}</dd></div><div><dt>Why unsafe</dt><dd>${insightCell(p.why_not_safe || 'none', 'unsafe reason')}</dd></div><div><dt>Purpose</dt><dd>${insightCell(p.primary_purpose || (p.description || '').split('\\n')[0], 'package purpose')}</dd></div></dl></article>`).join('') : '<article class="package-card"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></article>';
         document.querySelectorAll('.details-button').forEach(button => button.addEventListener('click', () => showPackage(button.dataset.packageId)));
         document.querySelectorAll('.insight-expand').forEach(button => button.addEventListener('click', () => {
           const cell = button.closest('.insight-cell');
@@ -2015,7 +2129,7 @@ def dashboard_html() -> str:
           $('insight-reader').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
         }));
       } catch (error) {
-        $('packages').innerHTML = `<tr><td colspan="11"><div class="state error"><strong>Could not load package data</strong>${esc(error.message || error)}</div></td></tr>`;
+        $('packages').innerHTML = `<tr><td colspan="12"><div class="state error"><strong>Could not load package data</strong>${esc(error.message || error)}</div></td></tr>`;
         $('package-cards').innerHTML = `<article class="package-card"><div class="state error"><strong>Could not load package data</strong>${esc(error.message || error)}</div></article>`;
       }
     }
@@ -2030,7 +2144,9 @@ def dashboard_html() -> str:
     async function showPackage(packageId) {
       const p = await fetch('/api/packages/' + encodeURIComponent(packageId)).then(r => r.json());
       const steps = (p.remediation || []).map(item => `<div class="remediation-item"><strong>${esc(item.action)} <span class="badge ${esc(item.priority === 'urgent' ? 'critical' : item.priority === 'high' ? 'high' : 'medium')}">${esc(item.priority)}</span></strong><span class="muted">${esc(item.owner)} - ${esc(item.evidence || '')}</span><ol>${(item.steps || []).map(step => `<li>${esc(step)}</li>`).join('')}</ol></div>`).join('');
-      $('remediation').innerHTML = `<div class="eyebrow">Package intelligence</div><h3>${esc(p.package)}</h3><div class="package-brief"><div class="brief-row"><span>Responsible for</span><strong>${esc(p.responsibility)}</strong></div><div class="brief-row"><span>Package purpose</span><strong>${esc(p.primary_purpose)}</strong></div><div class="brief-row"><span>Why it is not safe</span><strong>${esc(p.why_not_safe)}</strong></div><div class="brief-row"><span>Internal owner lane</span><strong>${esc(p.operational_owner)}</strong></div><div class="brief-row"><span>Upstream maintainer from package metadata</span><strong>${esc(p.upstream_maintainer)}</strong></div><div class="brief-row"><span>Architecture</span><strong>${esc(p.architecture || 'n/a')}</strong></div><div class="brief-row"><span>Checksum algorithm</span><strong>${esc((p.checksum_algorithm || 'unknown').toUpperCase())}</strong></div><div class="brief-row"><span>Impact</span><strong>${esc(p.impact)}</strong></div></div><p class="muted">${esc(p.recommended_action)}</p><div class="remediation-list">${steps || '<div class="remediation-item"><strong>No remediation required</strong><span class="muted">This package currently passes validation.</span></div>'}</div>`;
+      const sandboxEvidence = (p.sandbox_evidence || []).map(item => `<li>${esc(item)}</li>`).join('');
+      const sandboxFindings = (p.sandbox_findings || []).map(item => `<li>${esc(item)}</li>`).join('');
+      $('remediation').innerHTML = `<div class="eyebrow">Package intelligence</div><h3>${esc(p.package)}</h3><div class="package-brief"><div class="brief-row"><span>Responsible for</span><strong>${esc(p.responsibility)}</strong></div><div class="brief-row"><span>Package purpose</span><strong>${esc(p.primary_purpose)}</strong></div><div class="brief-row"><span>Why it is not safe</span><strong>${esc(p.why_not_safe)}</strong></div><div class="brief-row"><span>Sandbox verdict</span><strong><span class="badge ${statusClass(p.sandbox_status)}">${esc(p.sandbox_status || 'pending')}</span> ${esc(p.sandbox_verdict || 'not scanned')}</strong></div><div class="brief-row"><span>Sandbox next action</span><strong>${esc(p.sandbox_next_action || 'No sandbox action recorded.')}</strong></div><div class="brief-row"><span>Internal owner lane</span><strong>${esc(p.operational_owner)}</strong></div><div class="brief-row"><span>Upstream maintainer from package metadata</span><strong>${esc(p.upstream_maintainer)}</strong></div><div class="brief-row"><span>Architecture</span><strong>${esc(p.architecture || 'n/a')}</strong></div><div class="brief-row"><span>Checksum algorithm</span><strong>${esc((p.checksum_algorithm || 'unknown').toUpperCase())}</strong></div><div class="brief-row"><span>Impact</span><strong>${esc(p.impact)}</strong></div></div><p class="muted">${esc(p.recommended_action)}</p><div class="remediation-list"><div class="remediation-item"><strong>Sandbox evidence</strong><ol>${sandboxEvidence || '<li>No sandbox evidence recorded.</li>'}</ol>${sandboxFindings ? `<strong>Sandbox findings</strong><ol>${sandboxFindings}</ol>` : ''}</div>${steps || '<div class="remediation-item"><strong>No remediation required</strong><span class="muted">This package currently passes validation.</span></div>'}</div>`;
       document.querySelector('.scan-console').scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
     function editSource(repo) {
