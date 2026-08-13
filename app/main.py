@@ -8,6 +8,7 @@ import os
 import re
 import sqlite3
 import tempfile
+import threading
 import time
 import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager, closing
@@ -1112,6 +1113,16 @@ async def refresh_all(trigger: str = "manual") -> list[dict[str, Any]]:
     return results
 
 
+def launch_refresh(trigger: str) -> None:
+    def runner() -> None:
+        try:
+            __import__("asyncio").run(refresh_all(trigger))
+        except Exception as exc:  # noqa: BLE001
+            print(f"refresh trigger {trigger} failed: {exc}", flush=True)
+
+    threading.Thread(target=runner, name=f"pkgmng-refresh-{trigger}", daemon=True).start()
+
+
 def schedule_refresh() -> BackgroundScheduler:
     scheduler = BackgroundScheduler(timezone="UTC")
     scheduler.add_job(lambda: __import__("asyncio").run(refresh_all("scheduled")), "interval", minutes=REFRESH_INTERVAL_MINUTES)
@@ -1147,13 +1158,15 @@ def readyz() -> dict[str, Any]:
 @app.post("/api/refresh")
 async def api_refresh(request: Request, x_pkgmng_token: str = Header(default="")) -> JSONResponse:
     verify_action_request(request, x_pkgmng_token)
-    return JSONResponse({"results": await refresh_all("manual-refresh")})
+    launch_refresh("manual-refresh")
+    return JSONResponse({"status": "queued", "trigger": "manual-refresh"}, status_code=202)
 
 
 @app.post("/api/scans")
 async def api_scan(request: Request, x_pkgmng_token: str = Header(default="")) -> JSONResponse:
     verify_action_request(request, x_pkgmng_token)
-    return JSONResponse({"results": await refresh_all("manual")})
+    launch_refresh("manual")
+    return JSONResponse({"status": "queued", "trigger": "manual"}, status_code=202)
 
 
 @app.get("/api/scans")
