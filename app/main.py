@@ -1119,6 +1119,24 @@ def launch_refresh(trigger: str) -> None:
             __import__("asyncio").run(refresh_all(trigger))
         except Exception as exc:  # noqa: BLE001
             print(f"refresh trigger {trigger} failed: {exc}", flush=True)
+            with closing(connect_db()) as conn:
+                conn.execute(
+                    """
+                    UPDATE scan_runs
+                    SET status = 'failed',
+                        finished_at = ?,
+                        notes = ?
+                    WHERE id = (
+                        SELECT id
+                        FROM scan_runs
+                        WHERE status = 'running' AND trigger = ?
+                        ORDER BY id DESC
+                        LIMIT 1
+                    )
+                    """,
+                    (now_iso(), f"Scan worker failed before completion: {exc}", trigger),
+                )
+                conn.commit()
 
     threading.Thread(target=runner, name=f"pkgmng-refresh-{trigger}", daemon=True).start()
 
@@ -1166,7 +1184,61 @@ async def api_refresh(request: Request, x_pkgmng_token: str = Header(default="")
 async def api_scan(request: Request, x_pkgmng_token: str = Header(default="")) -> JSONResponse:
     verify_action_request(request, x_pkgmng_token)
     launch_refresh("manual")
-    return JSONResponse({"status": "queued", "trigger": "manual"}, status_code=202)
+    return JSONResponse(
+        {
+            "status": "queued",
+            "trigger": "manual",
+            "message": "Full repository refresh, security validation, and sandbox preflight queued.",
+        },
+        status_code=202,
+    )
+
+
+@app.post("/api/sandbox/scans")
+async def api_sandbox_scan(request: Request, x_pkgmng_token: str = Header(default="")) -> JSONResponse:
+    verify_action_request(request, x_pkgmng_token)
+    launch_refresh("manual-sandbox")
+    return JSONResponse(
+        {
+            "status": "queued",
+            "trigger": "manual-sandbox",
+            "message": "Sandbox metadata preflight queued for every indexed RPM and DEB.",
+        },
+        status_code=202,
+    )
+
+
+def scan_log_entries(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for run in runs:
+        status = run.get("status") or "unknown"
+        started_at = run.get("started_at") or ""
+        finished_at = run.get("finished_at") or ""
+        packages_total = int(run.get("packages_total") or 0)
+        repos_ok = int(run.get("repos_ok") or 0)
+        repos_total = int(run.get("repos_total") or 0)
+        notes = run.get("notes") or "No scan note recorded."
+        if status == "running":
+            message = f"Scan #{run.get('id')} is running from trigger {run.get('trigger')}; repository metadata is being refreshed and sandbox preflight is being recalculated."
+        elif status == "succeeded":
+            message = f"Scan #{run.get('id')} completed: {packages_total:,} packages validated across {repos_ok}/{repos_total} healthy repositories."
+        elif status == "degraded":
+            message = f"Scan #{run.get('id')} completed with repository errors: {packages_total:,} packages validated across {repos_ok}/{repos_total} healthy repositories."
+        elif status == "failed":
+            message = f"Scan #{run.get('id')} failed: {notes}"
+        else:
+            message = f"Scan #{run.get('id')} status is {status}: {notes}"
+        entries.append(
+            {
+                "run_id": run.get("id"),
+                "status": status,
+                "trigger": run.get("trigger"),
+                "timestamp": finished_at or started_at,
+                "message": message,
+                "notes": notes,
+            }
+        )
+    return entries
 
 
 @app.get("/api/scans")
@@ -1188,7 +1260,24 @@ def api_scans(limit: int = Query(10, ge=1, le=50)) -> dict[str, Any]:
             )
         ]
         current = runs[0] if runs else None
-    return {"current": current, "runs": runs}
+    return {"current": current, "runs": runs, "logs": scan_log_entries(runs)}
+
+
+@app.get("/api/sandbox/scans")
+def api_sandbox_scans(limit: int = Query(10, ge=1, le=50)) -> dict[str, Any]:
+    payload = api_scans(limit)
+    with closing(connect_db()) as conn:
+        totals = security_totals(conn)
+    return {
+        **payload,
+        "sandbox": {
+            "passed": totals["sandbox_passed"],
+            "review": totals["sandbox_review"],
+            "failed": totals["sandbox_failed"],
+            "pending": max(0, totals["total"] - totals["sandbox_passed"] - totals["sandbox_review"] - totals["sandbox_failed"]),
+            "next_action": "Start on-demand sandbox preflight after source edits, package refreshes, or remediation changes. Dynamic execution belongs in a disposable worker lane.",
+        },
+    }
 
 
 @app.get("/api/repos")
@@ -1697,6 +1786,11 @@ def dashboard_html() -> str:
     .scan-history { display:grid; gap:8px; margin-top:14px; }
     .scan-run { display:grid; grid-template-columns:auto 1fr auto; gap:10px; align-items:center; padding:9px 0; border-top:1px solid var(--line); }
     .scan-run code { font-family:"SFMono-Regular", Consolas, ui-monospace, monospace; font-size:12px; color:var(--ink); }
+    .sandbox-ops { display:grid; grid-template-columns:minmax(300px,.85fr) minmax(380px,1.15fr); gap:14px; margin:0 0 34px; }
+    .ops-log { display:grid; gap:8px; margin-top:14px; max-height:280px; overflow:auto; padding-right:4px; }
+    .ops-entry { display:grid; grid-template-columns:auto 1fr; gap:10px; align-items:start; padding:10px; border-radius:13px; background:color-mix(in srgb, var(--surface-2) 66%, transparent); border:1px solid var(--line); }
+    .ops-entry p { margin:3px 0 0; color:var(--muted); font-size:12px; line-height:1.45; }
+    .ops-entry code { font-family:"SFMono-Regular", Consolas, ui-monospace, monospace; font-size:12px; color:var(--ink); }
     .remediation-list { display:grid; gap:10px; margin-top:14px; }
     .remediation-item { padding:11px; border-radius:13px; background:color-mix(in srgb, var(--surface-2) 76%, transparent); border:1px solid var(--line); }
     .remediation-item strong { display:block; margin-bottom:6px; }
@@ -1774,6 +1868,7 @@ def dashboard_html() -> str:
       .metrics { grid-template-columns:repeat(2,minmax(120px,1fr)); }
       .security-grid { grid-template-columns:1fr; }
       .scan-console { grid-template-columns:1fr; }
+      .sandbox-ops { grid-template-columns:1fr; }
       .source-console { grid-template-columns:1fr; }
       .source-form { grid-template-columns:1fr; }
       .toolbar { grid-template-columns:1fr; }
@@ -1850,6 +1945,10 @@ def dashboard_html() -> str:
         <p class="muted">Sandbox status separates packages eligible for normal consumption, packages that need dynamic install observation, and packages blocked before execution because identity metadata is not trustworthy.</p>
       </div>
       <section class="security-grid" id="sandbox-summary" aria-label="Sandbox validation summary"></section>
+      <section class="sandbox-ops" aria-label="Sandbox scan operations">
+        <article class="scan-card" id="sandbox-queue"></article>
+        <article class="scan-card" id="sandbox-logs"></article>
+      </section>
       <div class="section-head" id="scan-section">
         <div>
           <div class="eyebrow">Scan operations</div>
@@ -2070,7 +2169,7 @@ def dashboard_html() -> str:
       try {
         const filters = selectedFilters();
         const params = new URLSearchParams({ ...filters, limit: String(PAGE_LIMIT), offset: String(currentOffset) });
-        const [repos, families, versions, security, scans, packages] = await Promise.all([fetch('/api/repos').then(r => r.json()), fetch('/api/families').then(r => r.json()), fetch('/api/versions').then(r => r.json()), fetch('/api/security').then(r => r.json()), fetch('/api/scans').then(r => r.json()), fetch('/api/packages?' + params).then(r => r.json())]);
+        const [repos, families, versions, security, scans, sandboxOps, packages] = await Promise.all([fetch('/api/repos').then(r => r.json()), fetch('/api/families').then(r => r.json()), fetch('/api/versions').then(r => r.json()), fetch('/api/security').then(r => r.json()), fetch('/api/scans').then(r => r.json()), fetch('/api/sandbox/scans').then(r => r.json()), fetch('/api/packages?' + params).then(r => r.json())]);
         const totals = packages.totals || {};
         $('hero-summary').innerHTML = [
           ['Indexed packages', n(totals.total)],
@@ -2087,6 +2186,18 @@ def dashboard_html() -> str:
         $('sandbox-summary').innerHTML = `<article class="security-panel"><div class="eyebrow">Sandbox preflight</div><h3>${n(securityTotals.sandbox_review + securityTotals.sandbox_failed)} need action</h3><div class="risk-list"><div class="risk-item"><strong>Passed preflight</strong><span>${n(securityTotals.sandbox_passed)}</span></div><div class="risk-item"><strong>Needs dynamic sandbox</strong><span>${n(securityTotals.sandbox_review)}</span></div><div class="risk-item"><strong>Blocked before execution</strong><span>${n(securityTotals.sandbox_failed)}</span></div></div></article><article class="security-panel"><div class="eyebrow">How to proceed</div><h3>Sandbox lane</h3><p class="muted">Passed packages can stay in normal monitoring. Review packages need disposable-host install/remove observation. Blocked packages must first fix checksum, size, or artifact identity before any execution.</p><div class="scan-actions"><button class="ghost" id="sandbox-review-inline">Needs sandbox ${icon('arrow')}</button><button class="ghost" id="sandbox-blocked-inline">Blocked ${icon('arrow')}</button></div></article>`;
         $('sandbox-review-inline').addEventListener('click', () => { $('sandbox-status').value = 'review'; currentOffset = 0; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
         $('sandbox-blocked-inline').addEventListener('click', () => { $('sandbox-status').value = 'failed'; currentOffset = 0; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+        const sandboxCurrent = sandboxOps.current || {};
+        const sandboxTotals = sandboxOps.sandbox || {};
+        const sandboxRunning = sandboxCurrent.status === 'running';
+        const sandboxLogRows = (sandboxOps.logs || []).map(entry => `<div class="ops-entry"><span class="badge ${statusClass(entry.status)}">${esc(entry.status)}</span><div><code>#${esc(entry.run_id)} ${esc(entry.trigger || 'unknown')}</code><p>${esc(entry.message)}</p><p>${esc(entry.timestamp || 'no timestamp')}</p></div></div>`).join('');
+        $('sandbox-queue').innerHTML = `<div class="eyebrow">Sandbox run queue</div><h3>${sandboxRunning ? 'Sandbox scan running' : 'Ready for on-demand scan'}</h3><p class="muted">${sandboxRunning ? esc(sandboxCurrent.notes || 'The current sandbox preflight is recalculating package evidence.') : esc(sandboxTotals.next_action || 'Start sandbox preflight after source edits or remediation changes.')}</p><div class="risk-list"><div class="risk-item"><strong>Passed preflight</strong><span>${n(sandboxTotals.passed)}</span></div><div class="risk-item"><strong>Needs sandbox</strong><span>${n(sandboxTotals.review)}</span></div><div class="risk-item"><strong>Blocked</strong><span>${n(sandboxTotals.failed)}</span></div><div class="risk-item"><strong>Pending backfill</strong><span>${n(sandboxTotals.pending)}</span></div></div><div class="scan-actions"><button id="run-sandbox-inline">${sandboxRunning ? 'Scan running' : 'Start sandbox preflight'} ${icon(sandboxRunning ? 'refresh' : 'play')}</button><button class="ghost" id="sandbox-refresh-inline">Refresh status ${icon('refresh')}</button></div><p class="muted" id="sandbox-action-state" aria-live="polite"></p>`;
+        $('sandbox-logs').innerHTML = `<div class="eyebrow">Sandbox operation logs</div><h3>Queue and run history</h3><p class="muted">These logs are scan-run records from the platform database: queued/running/completed status, trigger label, package counts, and failure notes.</p><div class="scan-actions"><button class="ghost" id="sandbox-pending-inline">Pending ${icon('arrow')}</button><button class="ghost" id="sandbox-review-log-inline">Needs sandbox ${icon('arrow')}</button><button class="ghost" id="sandbox-failed-log-inline">Blocked ${icon('arrow')}</button></div><div class="ops-log">${sandboxLogRows || '<div class="ops-entry"><span class="badge pending">pending</span><div><code>No sandbox runs</code><p>Start sandbox preflight to create the first operation log.</p></div></div>'}</div>`;
+        $('run-sandbox-inline').disabled = sandboxRunning;
+        $('run-sandbox-inline').addEventListener('click', runSandboxScan);
+        $('sandbox-refresh-inline').addEventListener('click', load);
+        $('sandbox-pending-inline').addEventListener('click', () => { $('sandbox-status').value = 'pending'; currentOffset = 0; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+        $('sandbox-review-log-inline').addEventListener('click', () => { $('sandbox-status').value = 'review'; currentOffset = 0; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+        $('sandbox-failed-log-inline').addEventListener('click', () => { $('sandbox-status').value = 'failed'; currentOffset = 0; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
         const currentRun = scans.current || {};
         const history = (scans.runs || []).map(run => `<div class="scan-run"><span class="badge ${run.status === 'succeeded' ? 'passed' : run.status === 'running' ? 'pending' : run.status === 'degraded' ? 'review' : 'failed'}">${esc(run.status)}</span><div><code>#${esc(run.id)} ${esc(run.trigger)}</code><br><span class="muted">${esc(run.started_at)}${run.finished_at ? ' to ' + esc(run.finished_at) : ''}</span></div><span>${n(run.packages_total)} pkgs</span></div>`).join('');
         $('scan-runs').innerHTML = `<div class="eyebrow">Current scan</div><h3>${currentRun.id ? '#' + esc(currentRun.id) : 'No scan yet'}</h3><p class="muted">${esc(currentRun.notes || 'Run a scan to validate package metadata and generate remediation guidance.')}</p><div class="scan-actions"><button id="run-scan-inline">Run scan ${icon('play')}</button><button class="ghost" id="failed-inline">Failed only ${icon('arrow')}</button></div><div class="scan-history">${history || '<div class="scan-run"><span class="badge pending">pending</span><div><code>No runs recorded</code><br><span class="muted">Start with Run scan</span></div><span>0 pkgs</span></div>'}</div>`;
@@ -2149,10 +2260,40 @@ def dashboard_html() -> str:
     async function runScan() {
       $('scan').disabled = true;
       $('scan').innerHTML = `Scanning ${icon('refresh')}`;
-      await fetch('/api/scans', { method: 'POST' });
-      $('scan').disabled = false;
-      $('scan').innerHTML = `Run scan ${icon('play')}`;
-      load();
+      try {
+        const response = await fetch('/api/scans', { method: 'POST' });
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
+          throw new Error(body.detail || body.error || `Scan request failed with HTTP ${response.status}`);
+        }
+      } catch (error) {
+        $('remediation').innerHTML = `<div class="eyebrow">Scan request</div><h3>Could not queue scan</h3><p class="muted">${esc(error.message || error)}</p>`;
+      } finally {
+        $('scan').disabled = false;
+        $('scan').innerHTML = `Run scan ${icon('play')}`;
+        load();
+      }
+    }
+    async function runSandboxScan() {
+      const button = $('run-sandbox-inline');
+      const state = $('sandbox-action-state');
+      button.disabled = true;
+      button.innerHTML = `Queueing sandbox preflight ${icon('refresh')}`;
+      state.textContent = 'Requesting sandbox preflight queue...';
+      try {
+        const response = await fetch('/api/sandbox/scans', { method: 'POST' });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(body.detail || body.error || `Sandbox request failed with HTTP ${response.status}`);
+        }
+        state.textContent = body.message || 'Sandbox preflight queued.';
+      } catch (error) {
+        state.textContent = error.message || String(error);
+      } finally {
+        button.disabled = false;
+        button.innerHTML = `Start sandbox preflight ${icon('play')}`;
+        setTimeout(load, 900);
+      }
     }
     async function showPackage(packageId) {
       const p = await fetch('/api/packages/' + encodeURIComponent(packageId)).then(r => r.json());
@@ -2189,6 +2330,7 @@ def dashboard_html() -> str:
       $('q').value = '';
       $('status').value = '';
       $('severity').value = '';
+      $('sandbox-status').value = '';
       $('family').value = '';
       $('version').value = '';
       $('repo-filter').value = '';

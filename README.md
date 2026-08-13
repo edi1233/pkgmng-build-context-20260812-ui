@@ -90,13 +90,27 @@ Operators should start with `failed` packages, then `review` packages sorted by 
 
 For the full status glossary and operating procedure, see [Package Security Statuses](docs/operations.md#package-security-statuses).
 
+## Sandbox validation
+
+Every package also receives a sandbox preflight profile:
+
+| Field | Meaning |
+|---|---|
+| `sandbox_status=passed` | Metadata preflight found no behavior trigger. Keep the package under normal scheduled monitoring. |
+| `sandbox_status=review` | The package should be installed and removed in an isolated disposable host lane before production promotion. |
+| `sandbox_status=failed` | Do not execute the package yet. Fix blocking identity metadata such as checksum, type, or size first. |
+
+Sandbox evidence explains the package format, artifact path, source repository, and reason the package did or did not need dynamic observation. `sandbox_next_action` tells the operator how to proceed. Current sandboxing is a platform decision lane and metadata preflight; dynamic binary execution should run in a disposable VM/container host lane, not inside the web app pod.
+
 ## Scan and remediation workflow
 
 - `POST /api/scans` launches a repository refresh plus full package validation run with trigger `manual`.
+- `POST /api/sandbox/scans` queues the same validation pipeline with trigger `manual-sandbox`, making an on-demand sandbox preflight run explicit in history.
 - Scheduled refreshes record trigger `scheduled`; API refreshes record trigger `manual-refresh`.
 - `GET /api/scans` returns recent scan runs with status, trigger, repository health, total packages, pass/review/fail counts, and highest severity. It also marks orphaned `running` scans older than `SCAN_STALE_MINUTES` as failed.
+- `GET /api/sandbox/scans` returns the current run, derived operation logs, sandbox totals, and next-action guidance for the sandbox lane.
 - `GET /api/packages/{id}` returns the package validation profile with remediation guidance.
-- The UI includes a scan operations panel, scan history, a remediation queue, and package-row detail actions.
+- The UI includes a scan operations panel, scan history, a remediation queue, package-row detail actions, and a Sandbox run queue with **Start sandbox preflight**, **Refresh status**, operation logs, and Pending/Needs sandbox/Blocked shortcuts.
 - `GET /api/packages` supports `limit` and `offset` pagination and returns `page.total`, `page.returned`, `page.offset`, and `page.has_more`.
 - Package rows expose architecture and checksum algorithm so source/binary variants do not look like duplicates.
 - Package detail distinguishes the internal owner lane from the upstream maintainer recorded in package metadata.
