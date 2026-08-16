@@ -285,6 +285,16 @@ def init_db() -> None:
               highest_severity TEXT NOT NULL DEFAULT 'none',
               notes TEXT
             );
+            CREATE TABLE IF NOT EXISTS scan_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              scan_run_id INTEGER NOT NULL,
+              created_at TEXT NOT NULL,
+              level TEXT NOT NULL DEFAULT 'info',
+              stage TEXT NOT NULL,
+              repo_name TEXT,
+              message TEXT NOT NULL,
+              details TEXT NOT NULL DEFAULT '{}'
+            );
             CREATE TABLE IF NOT EXISTS sandbox_runs (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               requested_at TEXT NOT NULL,
@@ -318,6 +328,7 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_packages_name ON packages(package);
             CREATE INDEX IF NOT EXISTS idx_packages_status ON packages(security_status);
             CREATE INDEX IF NOT EXISTS idx_scan_runs_started ON scan_runs(started_at);
+            CREATE INDEX IF NOT EXISTS idx_scan_events_run ON scan_events(scan_run_id, id);
             CREATE INDEX IF NOT EXISTS idx_sandbox_runs_requested ON sandbox_runs(requested_at);
             CREATE INDEX IF NOT EXISTS idx_sandbox_package_logs_package ON sandbox_package_logs(package_id, id);
             """
@@ -1164,8 +1175,85 @@ def begin_scan_run(conn: sqlite3.Connection, trigger: str, repos_total: int) -> 
         (now_iso(), trigger, repos_total, "Repository metadata refresh and package security validation started."),
     )
     run_id = cursor.lastrowid
+    conn.execute(
+        """
+        INSERT INTO scan_events(scan_run_id, created_at, level, stage, message, details)
+        VALUES (?, ?, 'info', 'queued', ?, ?)
+        """,
+        (
+            run_id,
+            now_iso(),
+            f"Scan #{run_id} queued by {trigger}.",
+            json.dumps({"trigger": trigger, "repos_total": repos_total}),
+        ),
+    )
     conn.commit()
     return int(run_id)
+
+
+def write_scan_event(
+    run_id: int,
+    stage: str,
+    message: str,
+    *,
+    level: str = "info",
+    repo_name: str | None = None,
+    details: dict[str, Any] | None = None,
+) -> None:
+    try:
+        with closing(connect_db()) as conn:
+            conn.execute(
+                """
+                INSERT INTO scan_events(scan_run_id, created_at, level, stage, repo_name, message, details)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (run_id, now_iso(), level, stage, repo_name, message, json.dumps(details or {})),
+            )
+            conn.commit()
+    except sqlite3.OperationalError as exc:
+        print(f"could not write scan event for run #{run_id}: {exc}", flush=True)
+
+
+def scan_event_rows(conn: sqlite3.Connection, scan_id: int, limit: int = 100) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM scan_events
+        WHERE scan_run_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (scan_id, limit),
+    )
+    events: list[dict[str, Any]] = []
+    for row in rows:
+        event = dict(row)
+        event["details"] = json.loads(event.get("details") or "{}")
+        events.append(event)
+    events.reverse()
+    return events
+
+
+def scan_detail_payload(conn: sqlite3.Connection, scan_id: int, event_limit: int = 100) -> dict[str, Any]:
+    run = conn.execute("SELECT * FROM scan_runs WHERE id = ?", (scan_id,)).fetchone()
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"scan run {scan_id} not found")
+    run_dict = dict(run)
+    repos_total = int(run_dict.get("repos_total") or 0)
+    repos_done = int(run_dict.get("repos_ok") or 0) + int(run_dict.get("repos_error") or 0)
+    progress_percent = round((repos_done / repos_total) * 100, 1) if repos_total else 0
+    events = scan_event_rows(conn, scan_id, event_limit)
+    return {
+        "run": run_dict,
+        "progress": {
+            "repos_done": repos_done,
+            "repos_total": repos_total,
+            "percent": progress_percent,
+            "running": run_dict.get("status") == "running",
+        },
+        "events": events,
+        "logs": scan_log_entries([run_dict]),
+    }
 
 
 async def refresh_all(trigger: str = "manual", run_id: int | None = None) -> list[dict[str, Any]]:
@@ -1173,11 +1261,51 @@ async def refresh_all(trigger: str = "manual", run_id: int | None = None) -> lis
     if run_id is None:
         with closing(connect_db()) as conn:
             run_id = begin_scan_run(conn, trigger, len(repos))
-    results = [await refresh_repo(repo) for repo in repos]
+    write_scan_event(run_id, "started", f"Scan #{run_id} started; refreshing {len(repos)} repositories.", details={"repos_total": len(repos)})
+    results: list[dict[str, Any]] = []
+    repos_ok = 0
+    repos_error = 0
+    for repo in repos:
+        write_scan_event(run_id, "repo-started", f"Refreshing repository {repo.name}.", repo_name=repo.name)
+        result = await refresh_repo(repo)
+        results.append(result)
+        if result.get("status") == "ok":
+            repos_ok += 1
+            write_scan_event(
+                run_id,
+                "repo-finished",
+                f"Repository {repo.name} refreshed with {int(result.get('packages') or 0):,} packages.",
+                repo_name=repo.name,
+                details=result,
+            )
+        else:
+            repos_error += 1
+            write_scan_event(
+                run_id,
+                "repo-failed",
+                f"Repository {repo.name} failed: {result.get('error') or 'unknown error'}",
+                level="error",
+                repo_name=repo.name,
+                details=result,
+            )
+        with closing(connect_db()) as conn:
+            conn.execute(
+                """
+                UPDATE scan_runs
+                SET repos_ok = ?, repos_error = ?,
+                    notes = ?
+                WHERE id = ?
+                """,
+                (
+                    repos_ok,
+                    repos_error,
+                    f"Refreshing repositories: {repos_ok + repos_error}/{len(repos)} complete.",
+                    run_id,
+                ),
+            )
+            conn.commit()
     with closing(connect_db()) as conn:
         totals = security_totals(conn)
-        repos_ok = sum(1 for result in results if result.get("status") == "ok")
-        repos_error = len(results) - repos_ok
         status = "failed" if repos_ok == 0 else "degraded" if repos_error else "succeeded"
         conn.execute(
             """
@@ -1202,10 +1330,24 @@ async def refresh_all(trigger: str = "manual", run_id: int | None = None) -> lis
             ),
         )
         conn.commit()
+    write_scan_event(
+        run_id,
+        "finished",
+        f"Scan #{run_id} finished with status {status}: {totals['total']:,} packages validated.",
+        level="error" if status == "failed" else "info",
+        details={"status": status, "packages_total": totals["total"], "repos_ok": repos_ok, "repos_error": repos_error},
+    )
     return results
 
 
 def fail_scan_run(run_id: int, trigger: str, exc: Exception) -> None:
+    write_scan_event(
+        run_id,
+        "failed",
+        f"Scan #{run_id} failed while running trigger {trigger}: {exc}",
+        level="error",
+        details={"trigger": trigger, "error": str(exc)},
+    )
     last_error: Exception | None = None
     for _ in range(3):
         try:
@@ -1600,6 +1742,15 @@ def api_scans(limit: int = Query(10, ge=1, le=50)) -> dict[str, Any]:
         ]
         current = runs[0] if runs else None
     return {"current": current, "runs": runs, "logs": scan_log_entries(runs)}
+
+
+@app.get("/api/scans/{scan_id}")
+def api_scan_detail(scan_id: int, event_limit: int = Query(100, ge=1, le=250)) -> dict[str, Any]:
+    with closing(connect_db()) as conn:
+        stale_marked = mark_stale_scan_runs(conn)
+        if stale_marked:
+            conn.commit()
+        return scan_detail_payload(conn, scan_id, event_limit)
 
 
 @app.get("/api/sandbox/scans")
@@ -2118,7 +2269,16 @@ def dashboard_html() -> str:
     .scan-actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:16px; }
     .scan-history { display:grid; gap:8px; margin-top:14px; }
     .scan-run { display:grid; grid-template-columns:auto 1fr auto; gap:10px; align-items:center; padding:9px 0; border-top:1px solid var(--line); }
+    .scan-run button { appearance:none; border:0; background:transparent; text-align:left; padding:0; color:inherit; cursor:pointer; }
+    .scan-run[data-active="true"] { background:color-mix(in srgb, var(--primary-soft) 58%, transparent); margin-inline:-8px; padding-inline:8px; border-radius:12px; }
     .scan-run code { font-family:"SFMono-Regular", Consolas, ui-monospace, monospace; font-size:12px; color:var(--ink); }
+    .scan-progress { margin:12px 0; }
+    .scan-progress-bar { height:10px; border-radius:999px; background:var(--neutral-bg); overflow:hidden; border:1px solid var(--line); }
+    .scan-progress-bar span { display:block; height:100%; width:0; border-radius:999px; background:linear-gradient(90deg, var(--primary), var(--ok)); transition:width .2s ease; }
+    .scan-event-list { display:grid; gap:7px; max-height:360px; overflow:auto; padding-right:2px; }
+    .scan-event { display:grid; grid-template-columns:auto 1fr; gap:10px; padding:10px; border-radius:12px; border:1px solid var(--line); background:color-mix(in srgb, var(--surface-2) 70%, transparent); }
+    .scan-event p { margin:2px 0 0; color:var(--muted); font-size:12px; line-height:1.45; }
+    .scan-event strong { font-size:13px; }
     .sandbox-ops { display:grid; grid-template-columns:minmax(300px,.85fr) minmax(380px,1.15fr); gap:14px; margin:0 0 34px; }
     .ops-log { display:grid; gap:8px; margin-top:14px; max-height:280px; overflow:auto; padding-right:4px; }
     .ops-entry { display:grid; grid-template-columns:auto 1fr; gap:10px; align-items:start; padding:10px; border-radius:13px; background:color-mix(in srgb, var(--surface-2) 66%, transparent); border:1px solid var(--line); }
@@ -2295,6 +2455,7 @@ def dashboard_html() -> str:
       </div>
       <section class="scan-console" aria-label="Security scan operations">
         <article class="scan-card" id="scan-runs"></article>
+        <article class="scan-card" id="scan-detail"></article>
         <article class="remediation-card" id="remediation"></article>
       </section>
       <div class="section-head" id="version-section">
@@ -2443,6 +2604,8 @@ def dashboard_html() -> str:
     const PAGE_LIMIT = 100;
     let currentOffset = 0;
     let editingSourceName = '';
+    let selectedScanId = null;
+    let scanDetailTimer = null;
     const selectedPackageIds = new Set();
     const icon = (name) => `<span class="button-orb" aria-hidden="true"><svg><use href="#icon-${name}"></use></svg></span>`;
     const setTheme = (theme) => {
@@ -2500,6 +2663,39 @@ def dashboard_html() -> str:
         ? labels.map(([key, value]) => `<span class="filter-chip">${esc(key)}: ${esc(value)}</span>`).join('') + `<span class="filter-chip">${n(page.total || 0)} matches</span>`
         : `<span class="filter-chip">${n(page.total || 0)} packages across all filters</span>`;
     };
+    async function showScanDetail(scanId, options = {}) {
+      if (!scanId) {
+        $('scan-detail').innerHTML = `<div class="eyebrow">Live scan detail</div><h3>Select a scan run</h3><p class="muted">Click any scan run to see live repository progress, notes, and event logs while it executes.</p>`;
+        return;
+      }
+      selectedScanId = Number(scanId);
+      if (!options.quiet) {
+        $('scan-detail').innerHTML = `<div class="eyebrow">Live scan detail</div><h3>Loading scan #${esc(selectedScanId)}</h3><p class="muted">Fetching current run events...</p>`;
+      }
+      try {
+        const detail = await fetch('/api/scans/' + encodeURIComponent(selectedScanId)).then(r => {
+          if (!r.ok) throw new Error(`Scan detail failed with HTTP ${r.status}`);
+          return r.json();
+        });
+        const run = detail.run || {};
+        const progress = detail.progress || {};
+        const events = detail.events || [];
+        const status = run.status || 'unknown';
+        const percent = Math.max(0, Math.min(100, Number(progress.percent || 0)));
+        const eventRows = events.map(event => `<div class="scan-event"><span class="badge ${event.level === 'error' ? 'failed' : statusClass(event.level === 'warn' ? 'review' : 'passed')}">${esc(event.stage)}</span><div><strong>${esc(event.message)}</strong><p>${esc(event.created_at)}${event.repo_name ? ' · ' + esc(event.repo_name) : ''}</p></div></div>`).join('');
+        $('scan-detail').innerHTML = `<div class="eyebrow">Live scan detail</div><h3>Scan #${esc(run.id)} <span class="badge ${statusClass(status === 'succeeded' ? 'passed' : status === 'running' ? 'pending' : status === 'degraded' ? 'review' : status === 'failed' ? 'failed' : 'pending')}">${esc(status)}</span></h3><p class="muted">${esc(run.notes || 'No scan notes recorded yet.')}</p><div class="scan-progress"><div class="risk-item"><strong>Repository progress</strong><span>${n(progress.repos_done)} / ${n(progress.repos_total)} repos</span></div><div class="scan-progress-bar" aria-label="Scan progress"><span style="width:${percent}%"></span></div></div><div class="risk-list"><div class="risk-item"><strong>Trigger</strong><span>${esc(run.trigger || 'unknown')}</span></div><div class="risk-item"><strong>Started</strong><span>${esc(run.started_at || 'n/a')}</span></div><div class="risk-item"><strong>Finished</strong><span>${esc(run.finished_at || 'still running')}</span></div><div class="risk-item"><strong>Packages</strong><span>${n(run.packages_total)}</span></div></div><div class="scan-actions"><button class="ghost" id="scan-detail-refresh" type="button">Refresh detail ${icon('refresh')}</button></div><div class="scan-event-list">${eventRows || '<div class="scan-event"><span class="badge pending">pending</span><div><strong>No events recorded yet</strong><p>The scan worker writes events as it starts and finishes each repository.</p></div></div>'}</div>`;
+        $('scan-detail-refresh').addEventListener('click', () => showScanDetail(selectedScanId));
+        if (scanDetailTimer) {
+          clearTimeout(scanDetailTimer);
+          scanDetailTimer = null;
+        }
+        if (status === 'running') {
+          scanDetailTimer = setTimeout(() => showScanDetail(selectedScanId, { quiet: true }), 5000);
+        }
+      } catch (error) {
+        $('scan-detail').innerHTML = `<div class="eyebrow">Live scan detail</div><h3>Could not load scan</h3><p class="muted">${esc(error.message || error)}</p>`;
+      }
+    }
     async function load() {
       $('packages').innerHTML = skeletonRows();
       $('package-cards').innerHTML = skeletonCards();
@@ -2541,12 +2737,19 @@ def dashboard_html() -> str:
         $('sandbox-review-log-inline').addEventListener('click', () => { $('sandbox-status').value = 'review'; currentOffset = 0; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
         $('sandbox-failed-log-inline').addEventListener('click', () => { $('sandbox-status').value = 'failed'; currentOffset = 0; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
         const currentRun = scans.current || {};
-        const history = (scans.runs || []).map(run => `<div class="scan-run"><span class="badge ${run.status === 'succeeded' ? 'passed' : run.status === 'running' ? 'pending' : run.status === 'degraded' ? 'review' : 'failed'}">${esc(run.status)}</span><div><code>#${esc(run.id)} ${esc(run.trigger)}</code><br><span class="muted">${esc(run.started_at)}${run.finished_at ? ' to ' + esc(run.finished_at) : ''}</span></div><span>${n(run.packages_total)} pkgs</span></div>`).join('');
+        if (!selectedScanId && currentRun.id) selectedScanId = Number(currentRun.id);
+        const history = (scans.runs || []).map(run => `<div class="scan-run" data-active="${String(Number(run.id) === Number(selectedScanId))}"><span class="badge ${run.status === 'succeeded' ? 'passed' : run.status === 'running' ? 'pending' : run.status === 'degraded' ? 'review' : 'failed'}">${esc(run.status)}</span><button type="button" class="scan-detail-open" data-scan-id="${esc(run.id)}"><code>#${esc(run.id)} ${esc(run.trigger)}</code><br><span class="muted">${esc(run.started_at)}${run.finished_at ? ' to ' + esc(run.finished_at) : ''}</span></button><span>${n(run.packages_total)} pkgs</span></div>`).join('');
         $('scan-runs').innerHTML = `<div class="eyebrow">Current scan</div><h3>${currentRun.id ? '#' + esc(currentRun.id) : 'No scan yet'}</h3><p class="muted">${esc(currentRun.notes || 'Run a scan to validate package metadata and generate remediation guidance.')}</p><div class="scan-actions"><button id="run-scan-inline">Run scan ${icon('play')}</button><button class="ghost" id="failed-inline">Failed only ${icon('arrow')}</button></div><div class="scan-history">${history || '<div class="scan-run"><span class="badge pending">pending</span><div><code>No runs recorded</code><br><span class="muted">Start with Run scan</span></div><span>0 pkgs</span></div>'}</div>`;
         const remediationRows = (security.top_risk || []).slice(0, 4).map(row => `<div class="remediation-item"><strong>${esc(row.package)} <span class="badge ${esc(row.security_severity)}">${esc(row.security_severity)}</span></strong><span class="muted">${esc(row.responsibility || row.category || 'Package intelligence')}</span><br><span class="muted">${esc(row.why_not_safe || (row.security_findings || []).join('; ') || 'manual review')}</span></div>`).join('');
         $('remediation').innerHTML = `<div class="eyebrow">Remediation queue</div><h3>${n(securityTotals.review + securityTotals.failed)} actions</h3><p class="muted">Open a package row to see the exact owner, priority, evidence, and fix steps for each failed or review check.</p><div class="remediation-list">${remediationRows || '<div class="remediation-item"><strong>No active remediation</strong><span class="muted">All current package checks passed.</span></div>'}</div>`;
         $('run-scan-inline').addEventListener('click', runScan);
         $('failed-inline').addEventListener('click', () => { $('status').value = 'failed'; currentOffset = 0; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+        document.querySelectorAll('.scan-detail-open').forEach(button => button.addEventListener('click', () => {
+          selectedScanId = Number(button.dataset.scanId);
+          document.querySelectorAll('.scan-run').forEach(row => row.dataset.active = String(row.querySelector('.scan-detail-open')?.dataset.scanId === String(selectedScanId)));
+          showScanDetail(selectedScanId);
+        }));
+        showScanDetail(selectedScanId || currentRun.id, { quiet: Boolean(selectedScanId) });
         const familyValue = $('family').value;
         $('family').innerHTML = '<option value="">All families</option>' + families.map(f => `<option value="${esc(f.distro_family)}">${esc(f.distro_family)}</option>`).join('');
         $('family').value = familyValue;
@@ -2618,9 +2821,13 @@ def dashboard_html() -> str:
       $('scan').innerHTML = `Scanning ${icon('refresh')}`;
       try {
         const response = await fetch('/api/scans', { method: 'POST' });
+        const body = await response.json().catch(() => ({}));
         if (!response.ok) {
-          const body = await response.json().catch(() => ({}));
           throw new Error(body.detail || body.error || `Scan request failed with HTTP ${response.status}`);
+        }
+        if (body.run_id) {
+          selectedScanId = Number(body.run_id);
+          showScanDetail(selectedScanId);
         }
       } catch (error) {
         $('remediation').innerHTML = `<div class="eyebrow">Scan request</div><h3>Could not queue scan</h3><p class="muted">${esc(error.message || error)}</p>`;
