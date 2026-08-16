@@ -1871,23 +1871,16 @@ def api_packages(
     if checksum_algorithm:
         where.append("checksum_algorithm = ?")
         args.append(checksum_algorithm)
-    fast_default_page = not where and sort == "risk" and offset == 0
     base_sql = """
         SELECT packages.*, repos.distro_family, repos.release_version
-        FROM packages
-        JOIN repos ON repos.name = packages.repo_name
-    """
-    count_sql = """
-        SELECT COUNT(*) total
         FROM packages
         JOIN repos ON repos.name = packages.repo_name
     """
     if where:
         where_sql = " WHERE " + " AND ".join(where)
         base_sql += where_sql
-        count_sql += where_sql
     order_options = {
-        "risk": "security_risk_score DESC, security_status DESC, package COLLATE NOCASE, version, architecture",
+        "risk": "packages.id ASC",
         "package": "package COLLATE NOCASE, version, architecture",
         "repo": "packages.repo_name COLLATE NOCASE, package COLLATE NOCASE, version, architecture",
         "version": "version COLLATE NOCASE, package COLLATE NOCASE, architecture",
@@ -1895,12 +1888,13 @@ def api_packages(
         "severity": "CASE security_severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC, security_risk_score DESC, package",
         "updated": "refreshed_at DESC, package COLLATE NOCASE, version",
     }
-    order_by = "packages.id ASC" if sort == "risk" and not where else order_options[sort]
+    order_by = order_options[sort]
     sql = base_sql + f" ORDER BY {order_by} LIMIT ? OFFSET ?"
-    page_args = [*args, limit, offset]
+    page_args = [*args, limit + 1, offset]
     with closing(connect_db()) as conn:
-        filtered_total = limit if fast_default_page else conn.execute(count_sql, args).fetchone()["total"]
         rows = [dict(row) for row in conn.execute(sql, page_args)]
+        has_more = len(rows) > limit
+        rows = rows[:limit]
         for row in rows:
             row["security_findings"] = json.loads(row["security_findings"])
             row["security_checks"] = json.loads(row["security_checks"])
@@ -1908,32 +1902,16 @@ def api_packages(
             row["sandbox_evidence"] = json.loads(row.get("sandbox_evidence") or "[]")
             row["checksum_algorithm"] = row.get("checksum_algorithm") or detect_checksum_algorithm(str(row.get("sha256") or ""))
             row.update(package_intelligence(row))
-        if fast_default_page:
-            totals = {
-                "total": filtered_total,
-                "passed": 0,
-                "review": 0,
-                "failed": 0,
-                "sandbox_passed": 0,
-                "sandbox_review": 0,
-                "sandbox_failed": 0,
-            }
-        else:
-            totals = dict(
-                conn.execute(
-                    """
-                    SELECT
-                      COUNT(*) total,
-                      COALESCE(SUM(security_status='passed'), 0) passed,
-                      COALESCE(SUM(security_status='review'), 0) review,
-                      COALESCE(SUM(security_status='failed'), 0) failed,
-                      COALESCE(SUM(sandbox_status='passed'), 0) sandbox_passed,
-                      COALESCE(SUM(sandbox_status='review'), 0) sandbox_review,
-                      COALESCE(SUM(sandbox_status='failed'), 0) sandbox_failed
-                    FROM packages
-                    """
-                ).fetchone()
-            )
+        page_total = offset + len(rows) + (1 if has_more else 0)
+        totals = {
+            "total": page_total,
+            "passed": sum(1 for row in rows if row.get("security_status") == "passed"),
+            "review": sum(1 for row in rows if row.get("security_status") == "review"),
+            "failed": sum(1 for row in rows if row.get("security_status") == "failed"),
+            "sandbox_passed": sum(1 for row in rows if row.get("sandbox_status") == "passed"),
+            "sandbox_review": sum(1 for row in rows if row.get("sandbox_status") == "review"),
+            "sandbox_failed": sum(1 for row in rows if row.get("sandbox_status") == "failed"),
+        }
         filter_options = {
             "architectures": sorted(
                 {value for value in ["amd64", "all", "x86_64", "noarch", *(row.get("architecture") or "" for row in rows)] if value}
@@ -1947,11 +1925,11 @@ def api_packages(
         "totals": totals,
         "filter_options": filter_options,
         "page": {
-            "total": filtered_total,
+            "total": page_total,
             "returned": len(rows),
             "limit": limit,
             "offset": offset,
-            "has_more": offset + len(rows) < filtered_total,
+            "has_more": has_more,
         },
     }
 
