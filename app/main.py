@@ -1938,9 +1938,9 @@ def api_security() -> dict[str, Any]:
                        repos.distro_family, repos.release_version
                 FROM packages
                 JOIN repos ON repos.name = packages.repo_name
-                WHERE packages.security_status != 'passed'
+                WHERE packages.security_status IN ('failed', 'review')
                 ORDER BY packages.id ASC
-                LIMIT 200
+                LIMIT 50
                 """
             )
         ]
