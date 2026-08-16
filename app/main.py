@@ -1871,6 +1871,7 @@ def api_packages(
     if checksum_algorithm:
         where.append("checksum_algorithm = ?")
         args.append(checksum_algorithm)
+    fast_default_page = not where and sort == "risk" and offset == 0
     base_sql = """
         SELECT packages.*, repos.distro_family, repos.release_version
         FROM packages
@@ -1898,7 +1899,7 @@ def api_packages(
     sql = base_sql + f" ORDER BY {order_by} LIMIT ? OFFSET ?"
     page_args = [*args, limit, offset]
     with closing(connect_db()) as conn:
-        filtered_total = conn.execute(count_sql, args).fetchone()["total"]
+        filtered_total = limit if fast_default_page else conn.execute(count_sql, args).fetchone()["total"]
         rows = [dict(row) for row in conn.execute(sql, page_args)]
         for row in rows:
             row["security_findings"] = json.loads(row["security_findings"])
@@ -1907,21 +1908,32 @@ def api_packages(
             row["sandbox_evidence"] = json.loads(row.get("sandbox_evidence") or "[]")
             row["checksum_algorithm"] = row.get("checksum_algorithm") or detect_checksum_algorithm(str(row.get("sha256") or ""))
             row.update(package_intelligence(row))
-        totals = dict(
-            conn.execute(
-                """
-                SELECT
-                  COUNT(*) total,
-                  COALESCE(SUM(security_status='passed'), 0) passed,
-                  COALESCE(SUM(security_status='review'), 0) review,
-                  COALESCE(SUM(security_status='failed'), 0) failed,
-                  COALESCE(SUM(sandbox_status='passed'), 0) sandbox_passed,
-                  COALESCE(SUM(sandbox_status='review'), 0) sandbox_review,
-                  COALESCE(SUM(sandbox_status='failed'), 0) sandbox_failed
-                FROM packages
-                """
-            ).fetchone()
-        )
+        if fast_default_page:
+            totals = {
+                "total": filtered_total,
+                "passed": 0,
+                "review": 0,
+                "failed": 0,
+                "sandbox_passed": 0,
+                "sandbox_review": 0,
+                "sandbox_failed": 0,
+            }
+        else:
+            totals = dict(
+                conn.execute(
+                    """
+                    SELECT
+                      COUNT(*) total,
+                      COALESCE(SUM(security_status='passed'), 0) passed,
+                      COALESCE(SUM(security_status='review'), 0) review,
+                      COALESCE(SUM(security_status='failed'), 0) failed,
+                      COALESCE(SUM(sandbox_status='passed'), 0) sandbox_passed,
+                      COALESCE(SUM(sandbox_status='review'), 0) sandbox_review,
+                      COALESCE(SUM(sandbox_status='failed'), 0) sandbox_failed
+                    FROM packages
+                    """
+                ).fetchone()
+            )
         filter_options = {
             "architectures": sorted(
                 {value for value in ["amd64", "all", "x86_64", "noarch", *(row.get("architecture") or "" for row in rows)] if value}
