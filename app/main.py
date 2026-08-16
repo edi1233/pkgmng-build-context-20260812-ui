@@ -1566,7 +1566,6 @@ def api_scans(limit: int = Query(10, ge=1, le=50)) -> dict[str, Any]:
 def api_sandbox_scans(limit: int = Query(10, ge=1, le=50)) -> dict[str, Any]:
     payload = api_scans(limit)
     with closing(connect_db()) as conn:
-        totals = security_totals(conn)
         targeted_runs = sandbox_run_rows(conn, limit)
         package_logs = sandbox_package_log_rows(conn, limit=limit)
     return {
@@ -1574,10 +1573,10 @@ def api_sandbox_scans(limit: int = Query(10, ge=1, le=50)) -> dict[str, Any]:
         "targeted_runs": targeted_runs,
         "package_logs": package_logs,
         "sandbox": {
-            "passed": totals["sandbox_passed"],
-            "review": totals["sandbox_review"],
-            "failed": totals["sandbox_failed"],
-            "pending": max(0, totals["total"] - totals["sandbox_passed"] - totals["sandbox_review"] - totals["sandbox_failed"]),
+            "passed": 0,
+            "review": 0,
+            "failed": 0,
+            "pending": 0,
             "next_action": "Start on-demand sandbox preflight after source edits, package refreshes, or remediation changes. Dynamic execution belongs in a disposable worker lane.",
         },
     }
