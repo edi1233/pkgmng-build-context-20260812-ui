@@ -317,6 +317,14 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_packages_name ON packages(package);
             CREATE INDEX IF NOT EXISTS idx_packages_status ON packages(security_status);
+            CREATE INDEX IF NOT EXISTS idx_packages_risk ON packages(security_risk_score DESC, security_status DESC, package COLLATE NOCASE, version, architecture);
+            CREATE INDEX IF NOT EXISTS idx_packages_sandbox_status ON packages(sandbox_status);
+            CREATE INDEX IF NOT EXISTS idx_packages_repo_name ON packages(repo_name);
+            CREATE INDEX IF NOT EXISTS idx_packages_repo_page ON packages(repo_name, package COLLATE NOCASE, version, architecture);
+            CREATE INDEX IF NOT EXISTS idx_packages_architecture ON packages(architecture);
+            CREATE INDEX IF NOT EXISTS idx_packages_checksum_algorithm ON packages(checksum_algorithm);
+            CREATE INDEX IF NOT EXISTS idx_packages_format ON packages(package_format);
+            CREATE INDEX IF NOT EXISTS idx_packages_refreshed ON packages(refreshed_at DESC);
             CREATE INDEX IF NOT EXISTS idx_scan_runs_started ON scan_runs(started_at);
             CREATE INDEX IF NOT EXISTS idx_sandbox_runs_requested ON sandbox_runs(requested_at);
             CREATE INDEX IF NOT EXISTS idx_sandbox_package_logs_package ON sandbox_package_logs(package_id, id);
@@ -1886,7 +1894,7 @@ def api_packages(
         base_sql += where_sql
         count_sql += where_sql
     order_by = {
-        "risk": "security_risk_score DESC, security_status DESC, package, version, architecture",
+        "risk": "security_risk_score DESC, security_status DESC, package COLLATE NOCASE, version, architecture",
         "package": "package COLLATE NOCASE, version, architecture",
         "repo": "packages.repo_name COLLATE NOCASE, package COLLATE NOCASE, version, architecture",
         "version": "version COLLATE NOCASE, package COLLATE NOCASE, architecture",
