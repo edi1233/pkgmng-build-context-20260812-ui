@@ -1923,18 +1923,12 @@ def api_packages(
             ).fetchone()
         )
         filter_options = {
-            "architectures": [
-                row["architecture"]
-                for row in conn.execute(
-                    "SELECT DISTINCT architecture FROM packages WHERE architecture IS NOT NULL AND architecture != '' ORDER BY architecture COLLATE NOCASE"
-                )
-            ],
-            "checksum_algorithms": [
-                row["checksum_algorithm"]
-                for row in conn.execute(
-                    "SELECT DISTINCT checksum_algorithm FROM packages WHERE checksum_algorithm IS NOT NULL AND checksum_algorithm != '' ORDER BY checksum_algorithm COLLATE NOCASE"
-                )
-            ],
+            "architectures": sorted(
+                {value for value in ["amd64", "all", "x86_64", "noarch", *(row.get("architecture") or "" for row in rows)] if value}
+            ),
+            "checksum_algorithms": sorted(
+                {value for value in ["sha1", "sha256", *(row.get("checksum_algorithm") or "" for row in rows)] if value}
+            ),
         }
     return {
         "packages": rows,
