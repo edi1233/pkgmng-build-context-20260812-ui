@@ -57,7 +57,9 @@ MAX_PACKAGES_PER_REPO = int(os.getenv("MAX_PACKAGES_PER_REPO", "0"))
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 ACTION_RATE_LIMIT_SECONDS = int(os.getenv("ACTION_RATE_LIMIT_SECONDS", "300"))
 SCAN_STALE_MINUTES = int(os.getenv("SCAN_STALE_MINUTES", "120"))
+DB_BUSY_TIMEOUT_SECONDS = float(os.getenv("DB_BUSY_TIMEOUT_SECONDS", "30"))
 ACTION_LAST_RUN: dict[str, float] = {}
+SCAN_LAUNCH_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -213,8 +215,11 @@ def upsert_repo_source(conn: sqlite3.Connection, repo: Repo, reset_status: bool 
 
 def connect_db() -> sqlite3.Connection:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_BUSY_TIMEOUT_SECONDS)
     conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout = {int(DB_BUSY_TIMEOUT_SECONDS * 1000)}")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
@@ -1109,10 +1114,11 @@ def begin_scan_run(conn: sqlite3.Connection, trigger: str, repos_total: int) -> 
     return int(run_id)
 
 
-async def refresh_all(trigger: str = "manual") -> list[dict[str, Any]]:
+async def refresh_all(trigger: str = "manual", run_id: int | None = None) -> list[dict[str, Any]]:
     repos = stored_repos()
-    with closing(connect_db()) as conn:
-        run_id = begin_scan_run(conn, trigger, len(repos))
+    if run_id is None:
+        with closing(connect_db()) as conn:
+            run_id = begin_scan_run(conn, trigger, len(repos))
     results = [await refresh_repo(repo) for repo in repos]
     with closing(connect_db()) as conn:
         totals = security_totals(conn)
@@ -1145,12 +1151,10 @@ async def refresh_all(trigger: str = "manual") -> list[dict[str, Any]]:
     return results
 
 
-def launch_refresh(trigger: str) -> None:
-    def runner() -> None:
+def fail_scan_run(run_id: int, trigger: str, exc: Exception) -> None:
+    last_error: Exception | None = None
+    for _ in range(3):
         try:
-            __import__("asyncio").run(refresh_all(trigger))
-        except Exception as exc:  # noqa: BLE001
-            print(f"refresh trigger {trigger} failed: {exc}", flush=True)
             with closing(connect_db()) as conn:
                 conn.execute(
                     """
@@ -1158,24 +1162,38 @@ def launch_refresh(trigger: str) -> None:
                     SET status = 'failed',
                         finished_at = ?,
                         notes = ?
-                    WHERE id = (
-                        SELECT id
-                        FROM scan_runs
-                        WHERE status = 'running' AND trigger = ?
-                        ORDER BY id DESC
-                        LIMIT 1
-                    )
+                    WHERE id = ?
                     """,
-                    (now_iso(), f"Scan worker failed before completion: {exc}", trigger),
+                    (now_iso(), f"Scan worker failed before completion: {exc}", run_id),
                 )
                 conn.commit()
+            return
+        except sqlite3.OperationalError as write_exc:
+            last_error = write_exc
+            time.sleep(1)
+    print(f"could not mark scan #{run_id} ({trigger}) failed: {last_error}", flush=True)
+
+
+def launch_refresh(trigger: str) -> dict[str, Any]:
+    repos = stored_repos()
+    with SCAN_LAUNCH_LOCK:
+        with closing(connect_db()) as conn:
+            run_id = begin_scan_run(conn, trigger, len(repos))
+
+    def runner() -> None:
+        try:
+            __import__("asyncio").run(refresh_all(trigger, run_id=run_id))
+        except Exception as exc:  # noqa: BLE001
+            print(f"refresh trigger {trigger} failed: {exc}", flush=True)
+            fail_scan_run(run_id, trigger, exc)
 
     threading.Thread(target=runner, name=f"pkgmng-refresh-{trigger}", daemon=True).start()
+    return {"run_id": run_id, "repos_total": len(repos)}
 
 
 def schedule_refresh() -> BackgroundScheduler:
     scheduler = BackgroundScheduler(timezone="UTC")
-    scheduler.add_job(lambda: __import__("asyncio").run(refresh_all("scheduled")), "interval", minutes=REFRESH_INTERVAL_MINUTES)
+    scheduler.add_job(lambda: launch_refresh("scheduled"), "interval", minutes=REFRESH_INTERVAL_MINUTES)
     scheduler.start()
     return scheduler
 
@@ -1208,18 +1226,19 @@ def readyz() -> dict[str, Any]:
 @app.post("/api/refresh")
 async def api_refresh(request: Request, x_pkgmng_token: str = Header(default="")) -> JSONResponse:
     verify_action_request(request, x_pkgmng_token)
-    launch_refresh("manual-refresh")
-    return JSONResponse({"status": "queued", "trigger": "manual-refresh"}, status_code=202)
+    queued = launch_refresh("manual-refresh")
+    return JSONResponse({"status": "queued", "trigger": "manual-refresh", **queued}, status_code=202)
 
 
 @app.post("/api/scans")
 async def api_scan(request: Request, x_pkgmng_token: str = Header(default="")) -> JSONResponse:
     verify_action_request(request, x_pkgmng_token)
-    launch_refresh("manual")
+    queued = launch_refresh("manual")
     return JSONResponse(
         {
             "status": "queued",
             "trigger": "manual",
+            **queued,
             "message": "Full repository refresh, security validation, and sandbox preflight queued.",
         },
         status_code=202,
@@ -1247,11 +1266,12 @@ async def api_sandbox_scan(request: Request, x_pkgmng_token: str = Header(defaul
             },
             status_code=202,
         )
-    launch_refresh("manual-sandbox")
+    queued = launch_refresh("manual-sandbox")
     return JSONResponse(
         {
             "status": "queued",
             "trigger": "manual-sandbox",
+            **queued,
             "message": "Sandbox metadata preflight queued for every indexed RPM and DEB.",
         },
         status_code=202,
