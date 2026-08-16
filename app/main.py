@@ -1090,6 +1090,20 @@ def mark_stale_scan_runs(conn: sqlite3.Connection) -> int:
     return len(stale_ids)
 
 
+def mark_interrupted_scan_runs(conn: sqlite3.Connection) -> int:
+    cursor = conn.execute(
+        """
+        UPDATE scan_runs
+        SET status = 'failed',
+            finished_at = ?,
+            notes = 'Scan run was interrupted by application startup before completion.'
+        WHERE status = 'running'
+        """,
+        (now_iso(),),
+    )
+    return int(cursor.rowcount or 0)
+
+
 def begin_scan_run(conn: sqlite3.Connection, trigger: str, repos_total: int) -> int:
     conn.execute("BEGIN IMMEDIATE")
     mark_stale_scan_runs(conn)
@@ -1201,6 +1215,10 @@ def schedule_refresh() -> BackgroundScheduler:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
+    with closing(connect_db()) as conn:
+        interrupted = mark_interrupted_scan_runs(conn)
+        if interrupted:
+            conn.commit()
     scheduler = schedule_refresh()
     try:
         yield
