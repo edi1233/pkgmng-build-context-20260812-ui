@@ -327,7 +327,6 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_packages_name ON packages(package);
             CREATE INDEX IF NOT EXISTS idx_packages_status ON packages(security_status);
-            CREATE INDEX IF NOT EXISTS idx_packages_sandbox_status ON packages(sandbox_status);
             CREATE INDEX IF NOT EXISTS idx_scan_runs_started ON scan_runs(started_at);
             CREATE INDEX IF NOT EXISTS idx_scan_events_run ON scan_events(scan_run_id, id);
             CREATE INDEX IF NOT EXISTS idx_sandbox_runs_requested ON sandbox_runs(requested_at);
@@ -1057,38 +1056,25 @@ def security_totals(conn: sqlite3.Connection) -> dict[str, Any]:
 def sandbox_totals(conn: sqlite3.Connection) -> dict[str, Any]:
     row = conn.execute(
         """
-        SELECT
-          COUNT(*) total,
-          COALESCE(SUM(sandbox_status='passed'), 0) passed,
-          COALESCE(SUM(sandbox_status='review'), 0) review,
-          COALESCE(SUM(sandbox_status='failed'), 0) failed,
-          COALESCE(SUM(sandbox_status='pending'), 0) pending
-        FROM packages
+        SELECT packages_total
+        FROM scan_runs
+        WHERE status IN ('succeeded', 'degraded')
+        ORDER BY id DESC
+        LIMIT 1
         """
     ).fetchone()
-    total = int(row["total"] or 0)
-    review = int(row["review"] or 0)
-    failed = int(row["failed"] or 0)
-    pending = int(row["pending"] or 0)
-    if failed:
-        next_action = "Resolve blocked package identity metadata before any package execution."
-    elif review:
-        next_action = "Run dynamic sandbox workers for packages marked Needs dynamic test before promotion."
-    elif pending:
-        next_action = "Run sandbox preflight to backfill packages that have not been checked yet."
-    elif total:
-        next_action = "All indexed packages passed metadata preflight; keep scheduled monitoring enabled."
-    else:
-        next_action = "Index repository sources before running sandbox preflight."
+    total = int(row["packages_total"] or 0) if row else 0
+    next_action = "Use the package table Sandbox filter for exact package-level states. Dynamic execution belongs in disposable sandbox workers."
     return {
         "total": total,
-        "passed": int(row["passed"] or 0),
-        "review": review,
-        "failed": failed,
-        "pending": pending,
+        "passed": None,
+        "review": None,
+        "failed": None,
+        "pending": None,
         "next_action": next_action,
         "mode": "metadata-preflight",
         "dynamic_execution": "not-run-in-web-pod",
+        "counts_available": False,
     }
 
 
@@ -1111,10 +1097,12 @@ def latest_scan_totals(conn: sqlite3.Connection) -> dict[str, Any]:
             "critical": 0,
             "high": 0,
             "medium": 0,
-            "sandbox_passed": 0,
-            "sandbox_review": 0,
-            "sandbox_failed": 0,
-            "avg_risk": 0,
+        "sandbox_passed": 0,
+        "sandbox_review": 0,
+        "sandbox_failed": 0,
+        "sandbox_pending": 0,
+        "sandbox_counts_available": False,
+        "avg_risk": 0,
         }
     severity = row["highest_severity"] or "none"
     sandbox = sandbox_totals(conn)
@@ -1130,6 +1118,7 @@ def latest_scan_totals(conn: sqlite3.Connection) -> dict[str, Any]:
         "sandbox_review": sandbox["review"],
         "sandbox_failed": sandbox["failed"],
         "sandbox_pending": sandbox["pending"],
+        "sandbox_counts_available": sandbox["counts_available"],
         "avg_risk": 0,
     }
 
@@ -2674,6 +2663,7 @@ def dashboard_html() -> str:
       queued: 'Queued'
     }[value] || value || 'Unknown');
     const n = (value) => Number(value || 0).toLocaleString();
+    const countOrFilter = (value) => value === null || value === undefined ? 'Use filter' : n(value);
     const insightCell = (text, label) => {
       const value = String(text || 'none');
       const needsToggle = value.length > 92;
@@ -2732,7 +2722,9 @@ def dashboard_html() -> str:
       const lanes = (security.by_family || []).slice(0, 10).map(row => `<div class="risk-item"><strong>${esc(row.distro_family)} v${esc(row.release_version || 'n/a')}</strong><span>${n(row.review)} review / ${n(row.failed)} failed</span></div>`).join('');
       const topRisk = (security.top_risk || []).slice(0, 8).map(row => `<div class="risk-item"><strong>${esc(row.package)}</strong><span>${esc(row.security_severity)} - ${n(row.security_risk_score)} / ${n(row.affected_variants || 1)} variants</span></div>`).join('');
       $('security').innerHTML = `<article class="security-panel"><div class="eyebrow">Average risk</div><h3>${avgRisk.toFixed(1)} / 100</h3><div class="risk-meter"><span style="width:${avgRisk}%"></span></div><p class="muted">${n(securityTotals.total)} packages scanned, ${n(securityTotals.critical)} critical metadata failures, ${n(securityTotals.high)} high review signals.</p><div class="risk-list">${lanes || '<div class="risk-item"><strong>No scan data</strong><span>refresh index</span></div>'}</div></article><article class="security-panel"><div class="eyebrow">Highest risk packages</div><h3>Validation queue</h3><div class="risk-list">${topRisk || '<div class="risk-item"><strong>No packages need review</strong><span>clear</span></div>'}</div></article>`;
-      $('sandbox-summary').innerHTML = `<article class="security-panel"><div class="eyebrow">Sandbox preflight</div><h3>${n(securityTotals.sandbox_review + securityTotals.sandbox_failed)} need action</h3><p class="muted">These counts are metadata preflight decisions. They do not mean dynamic package execution has already happened.</p><div class="risk-list"><div class="risk-item"><strong>Preflight passed</strong><span>${n(securityTotals.sandbox_passed)}</span></div><div class="risk-item"><strong>Needs dynamic test</strong><span>${n(securityTotals.sandbox_review)}</span></div><div class="risk-item"><strong>Blocked before execution</strong><span>${n(securityTotals.sandbox_failed)}</span></div><div class="risk-item"><strong>Not checked</strong><span>${n(securityTotals.sandbox_pending)}</span></div></div></article><article class="security-panel"><div class="eyebrow">How to proceed</div><h3>Sandbox lane</h3><p class="muted">Preflight-passed packages can stay in normal monitoring. Needs dynamic test means run disposable-host install/remove observation. Blocked packages must first fix checksum, size, or artifact identity before any execution.</p><div class="scan-actions"><button class="ghost" id="sandbox-review-inline">Needs dynamic test ${icon('arrow')}</button><button class="ghost" id="sandbox-blocked-inline">Blocked ${icon('arrow')}</button></div></article>`;
+      const sandboxCountsAvailable = securityTotals.sandbox_counts_available !== false;
+      const sandboxNeedAction = sandboxCountsAvailable ? n(securityTotals.sandbox_review + securityTotals.sandbox_failed) + ' need action' : 'Filter for exact state';
+      $('sandbox-summary').innerHTML = `<article class="security-panel"><div class="eyebrow">Sandbox preflight</div><h3>${sandboxNeedAction}</h3><p class="muted">These are metadata preflight decisions. They do not mean dynamic package execution has already happened.</p><div class="risk-list"><div class="risk-item"><strong>Preflight passed</strong><span>${countOrFilter(securityTotals.sandbox_passed)}</span></div><div class="risk-item"><strong>Needs dynamic test</strong><span>${countOrFilter(securityTotals.sandbox_review)}</span></div><div class="risk-item"><strong>Blocked before execution</strong><span>${countOrFilter(securityTotals.sandbox_failed)}</span></div><div class="risk-item"><strong>Not checked</strong><span>${countOrFilter(securityTotals.sandbox_pending)}</span></div></div></article><article class="security-panel"><div class="eyebrow">How to proceed</div><h3>Sandbox lane</h3><p class="muted">Preflight-passed packages can stay in normal monitoring. Needs dynamic test means run disposable-host install/remove observation. Blocked packages must first fix checksum, size, or artifact identity before any execution.</p><div class="scan-actions"><button class="ghost" id="sandbox-review-inline">Needs dynamic test ${icon('arrow')}</button><button class="ghost" id="sandbox-blocked-inline">Blocked ${icon('arrow')}</button></div></article>`;
       attachSandboxSummaryFilters();
       const remediationRows = (security.top_risk || []).slice(0, 4).map(row => `<div class="remediation-item"><strong>${esc(row.package)} <span class="badge ${esc(row.security_severity)}">${esc(row.security_severity)}</span></strong><span class="muted">${esc(row.responsibility || row.category || 'Package intelligence')}</span><br><span class="muted">${esc(row.why_not_safe || (row.security_findings || []).join('; ') || 'manual review')}</span></div>`).join('');
       $('remediation').innerHTML = `<div class="eyebrow">Remediation queue</div><h3>${n(securityTotals.review + securityTotals.failed)} actions</h3><p class="muted">Open a package row to see the exact owner, priority, evidence, and fix steps for each failed or review check.</p><div class="remediation-list">${remediationRows || '<div class="remediation-item"><strong>No active remediation</strong><span class="muted">All current package checks passed.</span></div>'}</div>`;
@@ -2799,7 +2791,7 @@ def dashboard_html() -> str:
         const sandboxLogRows = (sandboxOps.logs || []).map(entry => `<div class="ops-entry"><span class="badge ${statusClass(entry.status)}">${esc(scanStatusLabel(entry.status))}</span><div><code>#${esc(entry.run_id)} ${esc(entry.trigger || 'unknown')}</code><p>${esc(entry.message)}</p><p>${esc(entry.timestamp || 'no timestamp')}</p></div></div>`).join('');
         const targetedRows = (sandboxOps.targeted_runs || []).map(run => `<div class="ops-entry"><span class="badge ${statusClass(run.status)}">${esc(scanStatusLabel(run.status))}</span><div><code>target #${esc(run.id)} ${esc(run.trigger)}</code><p>${n(run.target_count)} selected packages: ${n(run.passed)} preflight passed, ${n(run.review)} need dynamic test, ${n(run.failed)} blocked.</p><p>${esc(run.finished_at || run.started_at || run.requested_at)}</p></div></div>`).join('');
         const packageLogRows = (sandboxOps.package_logs || []).map(log => `<div class="ops-entry"><span class="badge ${sandboxClass(log.status)}">${esc(sandboxLabel(log.status))}</span><div><code>${esc(log.package)} ${esc(log.version)} ${esc(log.architecture || '')}</code><p>${esc(log.verdict)} - ${esc(log.next_action)}</p><p>repo ${esc(log.repo_name)} · run #${esc(log.sandbox_run_id)}</p></div></div>`).join('');
-        $('sandbox-queue').innerHTML = `<div class="eyebrow">Sandbox run queue</div><h3>${sandboxRunning ? 'Preflight running' : 'Ready for on-demand preflight'}</h3><p class="muted">${sandboxRunning ? esc(sandboxCurrent.notes || 'The current metadata preflight is recalculating package evidence.') : esc(sandboxTotals.next_action || 'Start sandbox preflight after source edits or remediation changes.')}</p><p class="muted">Mode: metadata preflight. Dynamic package execution is not run inside the web pod.</p><div class="risk-list"><div class="risk-item"><strong>Preflight passed</strong><span>${n(sandboxTotals.passed)}</span></div><div class="risk-item"><strong>Needs dynamic test</strong><span>${n(sandboxTotals.review)}</span></div><div class="risk-item"><strong>Blocked</strong><span>${n(sandboxTotals.failed)}</span></div><div class="risk-item"><strong>Not checked</strong><span>${n(sandboxTotals.pending)}</span></div></div><div class="scan-actions"><button id="run-sandbox-inline">${sandboxRunning ? 'Preflight running' : 'Start preflight'} ${icon(sandboxRunning ? 'refresh' : 'play')}</button><button class="secondary" id="run-selected-sandbox-inline">Preflight selected ${icon('play')}</button><button class="ghost" id="clear-selected-inline">Clear selected ${icon('refresh')}</button><button class="ghost" id="sandbox-refresh-inline">Refresh status ${icon('refresh')}</button><span class="selected-state" id="selected-package-count">${n(selectedPackageIds.size)} selected</span></div><p class="muted" id="sandbox-action-state" aria-live="polite">Select up to 20 package rows to run metadata preflight only for those RPM/DEB records.</p>`;
+        $('sandbox-queue').innerHTML = `<div class="eyebrow">Sandbox run queue</div><h3>${sandboxRunning ? 'Preflight running' : 'Ready for on-demand preflight'}</h3><p class="muted">${sandboxRunning ? esc(sandboxCurrent.notes || 'The current metadata preflight is recalculating package evidence.') : esc(sandboxTotals.next_action || 'Start sandbox preflight after source edits or remediation changes.')}</p><p class="muted">Mode: metadata preflight. Dynamic package execution is not run inside the web pod.</p><div class="risk-list"><div class="risk-item"><strong>Preflight passed</strong><span>${countOrFilter(sandboxTotals.passed)}</span></div><div class="risk-item"><strong>Needs dynamic test</strong><span>${countOrFilter(sandboxTotals.review)}</span></div><div class="risk-item"><strong>Blocked</strong><span>${countOrFilter(sandboxTotals.failed)}</span></div><div class="risk-item"><strong>Not checked</strong><span>${countOrFilter(sandboxTotals.pending)}</span></div></div><div class="scan-actions"><button id="run-sandbox-inline">${sandboxRunning ? 'Preflight running' : 'Start preflight'} ${icon(sandboxRunning ? 'refresh' : 'play')}</button><button class="secondary" id="run-selected-sandbox-inline">Preflight selected ${icon('play')}</button><button class="ghost" id="clear-selected-inline">Clear selected ${icon('refresh')}</button><button class="ghost" id="sandbox-refresh-inline">Refresh status ${icon('refresh')}</button><span class="selected-state" id="selected-package-count">${n(selectedPackageIds.size)} selected</span></div><p class="muted" id="sandbox-action-state" aria-live="polite">Select up to 20 package rows to run metadata preflight only for those RPM/DEB records.</p>`;
         $('sandbox-logs').innerHTML = `<div class="eyebrow">Sandbox operation logs</div><h3>Preflight queue, targeted runs, and package evidence</h3><p class="muted">Logs show metadata preflight decisions and targeted package records. Dynamic execution logs will appear here after disposable sandbox workers are added.</p><div class="scan-actions"><button class="ghost" id="sandbox-pending-inline">Not checked ${icon('arrow')}</button><button class="ghost" id="sandbox-review-log-inline">Needs dynamic test ${icon('arrow')}</button><button class="ghost" id="sandbox-failed-log-inline">Blocked ${icon('arrow')}</button></div><div class="ops-log">${targetedRows || packageLogRows || sandboxLogRows || '<div class="ops-entry"><span class="badge pending">Not checked</span><div><code>No sandbox runs</code><p>Start preflight or select package rows to create operation logs.</p></div></div>'}</div>`;
         $('run-sandbox-inline').disabled = sandboxRunning;
         $('run-sandbox-inline').addEventListener('click', runSandboxScan);
