@@ -2663,6 +2663,23 @@ def dashboard_html() -> str:
         ? labels.map(([key, value]) => `<span class="filter-chip">${esc(key)}: ${esc(value)}</span>`).join('') + `<span class="filter-chip">${n(page.total || 0)} matches</span>`
         : `<span class="filter-chip">${n(page.total || 0)} packages across all filters</span>`;
     };
+    function attachSandboxSummaryFilters() {
+      const review = $('sandbox-review-inline');
+      const blocked = $('sandbox-blocked-inline');
+      if (review) review.addEventListener('click', () => { $('sandbox-status').value = 'review'; currentOffset = 0; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+      if (blocked) blocked.addEventListener('click', () => { $('sandbox-status').value = 'failed'; currentOffset = 0; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+    }
+    function renderSecuritySummary(security) {
+      const securityTotals = security.totals || {};
+      const avgRisk = Math.max(0, Math.min(100, Number(securityTotals.avg_risk || 0)));
+      const lanes = (security.by_family || []).slice(0, 10).map(row => `<div class="risk-item"><strong>${esc(row.distro_family)} v${esc(row.release_version || 'n/a')}</strong><span>${n(row.review)} review / ${n(row.failed)} failed</span></div>`).join('');
+      const topRisk = (security.top_risk || []).slice(0, 8).map(row => `<div class="risk-item"><strong>${esc(row.package)}</strong><span>${esc(row.security_severity)} - ${n(row.security_risk_score)} / ${n(row.affected_variants || 1)} variants</span></div>`).join('');
+      $('security').innerHTML = `<article class="security-panel"><div class="eyebrow">Average risk</div><h3>${avgRisk.toFixed(1)} / 100</h3><div class="risk-meter"><span style="width:${avgRisk}%"></span></div><p class="muted">${n(securityTotals.total)} packages scanned, ${n(securityTotals.critical)} critical metadata failures, ${n(securityTotals.high)} high review signals.</p><div class="risk-list">${lanes || '<div class="risk-item"><strong>No scan data</strong><span>refresh index</span></div>'}</div></article><article class="security-panel"><div class="eyebrow">Highest risk packages</div><h3>Validation queue</h3><div class="risk-list">${topRisk || '<div class="risk-item"><strong>No packages need review</strong><span>clear</span></div>'}</div></article>`;
+      $('sandbox-summary').innerHTML = `<article class="security-panel"><div class="eyebrow">Sandbox preflight</div><h3>${n(securityTotals.sandbox_review + securityTotals.sandbox_failed)} need action</h3><div class="risk-list"><div class="risk-item"><strong>Passed preflight</strong><span>${n(securityTotals.sandbox_passed)}</span></div><div class="risk-item"><strong>Needs dynamic sandbox</strong><span>${n(securityTotals.sandbox_review)}</span></div><div class="risk-item"><strong>Blocked before execution</strong><span>${n(securityTotals.sandbox_failed)}</span></div></div></article><article class="security-panel"><div class="eyebrow">How to proceed</div><h3>Sandbox lane</h3><p class="muted">Passed packages can stay in normal monitoring. Review packages need disposable-host install/remove observation. Blocked packages must first fix checksum, size, or artifact identity before any execution.</p><div class="scan-actions"><button class="ghost" id="sandbox-review-inline">Needs sandbox ${icon('arrow')}</button><button class="ghost" id="sandbox-blocked-inline">Blocked ${icon('arrow')}</button></div></article>`;
+      attachSandboxSummaryFilters();
+      const remediationRows = (security.top_risk || []).slice(0, 4).map(row => `<div class="remediation-item"><strong>${esc(row.package)} <span class="badge ${esc(row.security_severity)}">${esc(row.security_severity)}</span></strong><span class="muted">${esc(row.responsibility || row.category || 'Package intelligence')}</span><br><span class="muted">${esc(row.why_not_safe || (row.security_findings || []).join('; ') || 'manual review')}</span></div>`).join('');
+      $('remediation').innerHTML = `<div class="eyebrow">Remediation queue</div><h3>${n(securityTotals.review + securityTotals.failed)} actions</h3><p class="muted">Open a package row to see the exact owner, priority, evidence, and fix steps for each failed or review check.</p><div class="remediation-list">${remediationRows || '<div class="remediation-item"><strong>No active remediation</strong><span class="muted">All current package checks passed.</span></div>'}</div>`;
+    }
     async function showScanDetail(scanId, options = {}) {
       if (!scanId) {
         $('scan-detail').innerHTML = `<div class="eyebrow">Live scan detail</div><h3>Select a scan run</h3><p class="muted">Click any scan run to see live repository progress, notes, and event logs while it executes.</p>`;
@@ -2690,7 +2707,7 @@ def dashboard_html() -> str:
           scanDetailTimer = null;
         }
         if (status === 'running') {
-          scanDetailTimer = setTimeout(() => showScanDetail(selectedScanId, { quiet: true }), 5000);
+          scanDetailTimer = setTimeout(() => showScanDetail(selectedScanId, { quiet: true }), 15000);
         }
       } catch (error) {
         $('scan-detail').innerHTML = `<div class="eyebrow">Live scan detail</div><h3>Could not load scan</h3><p class="muted">${esc(error.message || error)}</p>`;
@@ -2700,10 +2717,13 @@ def dashboard_html() -> str:
       $('packages').innerHTML = skeletonRows();
       $('package-cards').innerHTML = skeletonCards();
       $('page-info').textContent = 'Loading package results...';
+      $('security').innerHTML = `<article class="security-panel"><div class="eyebrow">Security posture</div><h3><span class="skeleton"></span></h3><p class="muted">Loading aggregate security totals without blocking package rows.</p></article>`;
+      $('sandbox-summary').innerHTML = `<article class="security-panel"><div class="eyebrow">Sandbox preflight</div><h3><span class="skeleton"></span></h3><p class="muted">Loading sandbox aggregate status.</p></article>`;
+      $('remediation').innerHTML = `<div class="eyebrow">Remediation queue</div><h3>Loading actions</h3><p class="muted">Package results can be used while this panel updates.</p>`;
       try {
         const filters = selectedFilters();
         const params = new URLSearchParams({ ...filters, limit: String(PAGE_LIMIT), offset: String(currentOffset) });
-        const [repos, families, versions, security, scans, sandboxOps, packages] = await Promise.all([fetch('/api/repos').then(r => r.json()), fetch('/api/families').then(r => r.json()), fetch('/api/versions').then(r => r.json()), fetch('/api/security').then(r => r.json()), fetch('/api/scans').then(r => r.json()), fetch('/api/sandbox/scans').then(r => r.json()), fetch('/api/packages?' + params).then(r => r.json())]);
+        const [repos, families, versions, scans, sandboxOps, packages] = await Promise.all([fetch('/api/repos').then(r => r.json()), fetch('/api/families').then(r => r.json()), fetch('/api/versions').then(r => r.json()), fetch('/api/scans').then(r => r.json()), fetch('/api/sandbox/scans').then(r => r.json()), fetch('/api/packages?' + params).then(r => r.json())]);
         const totals = packages.totals || {};
         $('hero-summary').innerHTML = [
           ['Indexed packages', n(totals.total)],
@@ -2712,14 +2732,10 @@ def dashboard_html() -> str:
           ['Refresh cadence', '6h']
         ].map(([k,v]) => `<div class="scanline"><span>${k}</span><strong>${v}</strong></div>`).join('');
         $('metrics').innerHTML = [['Total', totals.total], ['Passed', totals.passed], ['Review', totals.review], ['Failed', totals.failed]].map(([k,v], i) => `<article class="metric" style="animation-delay:${i * 60}ms"><div class="metric-inner"><strong>${n(v)}</strong><span>${k}</span></div></article>`).join('');
-        const securityTotals = security.totals || {};
-        const avgRisk = Math.max(0, Math.min(100, Number(securityTotals.avg_risk || 0)));
-        const lanes = (security.by_family || []).slice(0, 10).map(row => `<div class="risk-item"><strong>${esc(row.distro_family)} v${esc(row.release_version || 'n/a')}</strong><span>${n(row.review)} review / ${n(row.failed)} failed</span></div>`).join('');
-        const topRisk = (security.top_risk || []).slice(0, 8).map(row => `<div class="risk-item"><strong>${esc(row.package)}</strong><span>${esc(row.security_severity)} - ${n(row.security_risk_score)} / ${n(row.affected_variants || 1)} variants</span></div>`).join('');
-        $('security').innerHTML = `<article class="security-panel"><div class="eyebrow">Average risk</div><h3>${avgRisk.toFixed(1)} / 100</h3><div class="risk-meter"><span style="width:${avgRisk}%"></span></div><p class="muted">${n(securityTotals.total)} packages scanned, ${n(securityTotals.critical)} critical metadata failures, ${n(securityTotals.high)} high review signals.</p><div class="risk-list">${lanes || '<div class="risk-item"><strong>No scan data</strong><span>refresh index</span></div>'}</div></article><article class="security-panel"><div class="eyebrow">Highest risk packages</div><h3>Validation queue</h3><div class="risk-list">${topRisk || '<div class="risk-item"><strong>No packages need review</strong><span>clear</span></div>'}</div></article>`;
-        $('sandbox-summary').innerHTML = `<article class="security-panel"><div class="eyebrow">Sandbox preflight</div><h3>${n(securityTotals.sandbox_review + securityTotals.sandbox_failed)} need action</h3><div class="risk-list"><div class="risk-item"><strong>Passed preflight</strong><span>${n(securityTotals.sandbox_passed)}</span></div><div class="risk-item"><strong>Needs dynamic sandbox</strong><span>${n(securityTotals.sandbox_review)}</span></div><div class="risk-item"><strong>Blocked before execution</strong><span>${n(securityTotals.sandbox_failed)}</span></div></div></article><article class="security-panel"><div class="eyebrow">How to proceed</div><h3>Sandbox lane</h3><p class="muted">Passed packages can stay in normal monitoring. Review packages need disposable-host install/remove observation. Blocked packages must first fix checksum, size, or artifact identity before any execution.</p><div class="scan-actions"><button class="ghost" id="sandbox-review-inline">Needs sandbox ${icon('arrow')}</button><button class="ghost" id="sandbox-blocked-inline">Blocked ${icon('arrow')}</button></div></article>`;
-        $('sandbox-review-inline').addEventListener('click', () => { $('sandbox-status').value = 'review'; currentOffset = 0; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
-        $('sandbox-blocked-inline').addEventListener('click', () => { $('sandbox-status').value = 'failed'; currentOffset = 0; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+        fetch('/api/security').then(r => r.json()).then(renderSecuritySummary).catch(error => {
+          $('security').innerHTML = `<article class="security-panel"><div class="eyebrow">Security posture</div><h3>Security summary unavailable</h3><p class="muted">${esc(error.message || error)}</p></article>`;
+          $('sandbox-summary').innerHTML = `<article class="security-panel"><div class="eyebrow">Sandbox preflight</div><h3>Sandbox summary unavailable</h3><p class="muted">Package-level sandbox filters remain available.</p></article>`;
+        });
         const sandboxCurrent = sandboxOps.current || {};
         const sandboxTotals = sandboxOps.sandbox || {};
         const sandboxRunning = sandboxCurrent.status === 'running';
@@ -2740,8 +2756,6 @@ def dashboard_html() -> str:
         if (!selectedScanId && currentRun.id) selectedScanId = Number(currentRun.id);
         const history = (scans.runs || []).map(run => `<div class="scan-run" data-active="${String(Number(run.id) === Number(selectedScanId))}"><span class="badge ${run.status === 'succeeded' ? 'passed' : run.status === 'running' ? 'pending' : run.status === 'degraded' ? 'review' : 'failed'}">${esc(run.status)}</span><button type="button" class="scan-detail-open" data-scan-id="${esc(run.id)}"><code>#${esc(run.id)} ${esc(run.trigger)}</code><br><span class="muted">${esc(run.started_at)}${run.finished_at ? ' to ' + esc(run.finished_at) : ''}</span></button><span>${n(run.packages_total)} pkgs</span></div>`).join('');
         $('scan-runs').innerHTML = `<div class="eyebrow">Current scan</div><h3>${currentRun.id ? '#' + esc(currentRun.id) : 'No scan yet'}</h3><p class="muted">${esc(currentRun.notes || 'Run a scan to validate package metadata and generate remediation guidance.')}</p><div class="scan-actions"><button id="run-scan-inline">Run scan ${icon('play')}</button><button class="ghost" id="failed-inline">Failed only ${icon('arrow')}</button></div><div class="scan-history">${history || '<div class="scan-run"><span class="badge pending">pending</span><div><code>No runs recorded</code><br><span class="muted">Start with Run scan</span></div><span>0 pkgs</span></div>'}</div>`;
-        const remediationRows = (security.top_risk || []).slice(0, 4).map(row => `<div class="remediation-item"><strong>${esc(row.package)} <span class="badge ${esc(row.security_severity)}">${esc(row.security_severity)}</span></strong><span class="muted">${esc(row.responsibility || row.category || 'Package intelligence')}</span><br><span class="muted">${esc(row.why_not_safe || (row.security_findings || []).join('; ') || 'manual review')}</span></div>`).join('');
-        $('remediation').innerHTML = `<div class="eyebrow">Remediation queue</div><h3>${n(securityTotals.review + securityTotals.failed)} actions</h3><p class="muted">Open a package row to see the exact owner, priority, evidence, and fix steps for each failed or review check.</p><div class="remediation-list">${remediationRows || '<div class="remediation-item"><strong>No active remediation</strong><span class="muted">All current package checks passed.</span></div>'}</div>`;
         $('run-scan-inline').addEventListener('click', runScan);
         $('failed-inline').addEventListener('click', () => { $('status').value = 'failed'; currentOffset = 0; load(); document.querySelector('#packages-table').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
         document.querySelectorAll('.scan-detail-open').forEach(button => button.addEventListener('click', () => {
