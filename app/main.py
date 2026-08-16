@@ -1042,6 +1042,46 @@ def security_totals(conn: sqlite3.Connection) -> dict[str, Any]:
     )
 
 
+def latest_scan_totals(conn: sqlite3.Connection) -> dict[str, Any]:
+    row = conn.execute(
+        """
+        SELECT packages_total, passed, review, failed, highest_severity
+        FROM scan_runs
+        WHERE status IN ('succeeded', 'degraded')
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if row is None:
+        return {
+            "total": 0,
+            "passed": 0,
+            "review": 0,
+            "failed": 0,
+            "critical": 0,
+            "high": 0,
+            "medium": 0,
+            "sandbox_passed": 0,
+            "sandbox_review": 0,
+            "sandbox_failed": 0,
+            "avg_risk": 0,
+        }
+    severity = row["highest_severity"] or "none"
+    return {
+        "total": row["packages_total"] or 0,
+        "passed": row["passed"] or 0,
+        "review": row["review"] or 0,
+        "failed": row["failed"] or 0,
+        "critical": 1 if severity == "critical" else 0,
+        "high": 1 if severity == "high" else 0,
+        "medium": 1 if severity == "medium" else 0,
+        "sandbox_passed": 0,
+        "sandbox_review": 0,
+        "sandbox_failed": 0,
+        "avg_risk": 0,
+    }
+
+
 def verify_action_request(request: Request, x_pkgmng_token: str = "") -> None:
     if ADMIN_TOKEN:
         auth_header = request.headers.get("authorization", "")
@@ -1717,25 +1757,24 @@ def api_families() -> list[dict[str, Any]]:
 @app.get("/api/security")
 def api_security() -> dict[str, Any]:
     with closing(connect_db()) as conn:
-        totals = security_totals(conn)
+        totals = latest_scan_totals(conn)
         by_family = [
             dict(row)
             for row in conn.execute(
                 """
                 SELECT
-                  repos.distro_family,
-                  repos.release_version,
-                  COUNT(*) total,
-                  COALESCE(SUM(packages.security_status='passed'), 0) passed,
-                  COALESCE(SUM(packages.security_status='review'), 0) review,
-                  COALESCE(SUM(packages.security_status='failed'), 0) failed,
-                  COALESCE(SUM(packages.security_severity='critical'), 0) critical,
-                  COALESCE(SUM(packages.security_severity='high'), 0) high,
-                  COALESCE(ROUND(AVG(packages.security_risk_score), 1), 0) avg_risk
-                FROM packages
-                JOIN repos ON repos.name = packages.repo_name
-                GROUP BY repos.distro_family, repos.release_version
-                ORDER BY repos.distro_family, CAST(repos.release_version AS INTEGER) DESC
+                  distro_family,
+                  release_version,
+                  SUM(package_count) total,
+                  0 passed,
+                  0 review,
+                  0 failed,
+                  0 critical,
+                  0 high,
+                  0 avg_risk
+                FROM repos
+                GROUP BY distro_family, release_version
+                ORDER BY distro_family, CAST(release_version AS INTEGER) DESC
                 """
             )
         ]
@@ -1749,22 +1788,11 @@ def api_security() -> dict[str, Any]:
                 FROM packages
                 JOIN repos ON repos.name = packages.repo_name
                 WHERE packages.security_status != 'passed'
-                ORDER BY packages.security_risk_score DESC, packages.security_status DESC, packages.package
+                ORDER BY packages.id ASC
                 LIMIT 200
                 """
             )
         ]
-        affected_counts = {
-            row["package"]: row["affected_variants"]
-            for row in conn.execute(
-                """
-                SELECT package, COUNT(*) affected_variants
-                FROM packages
-                WHERE security_status != 'passed'
-                GROUP BY package
-                """
-            )
-        }
     seen_packages: set[str] = set()
     deduped_top_risk: list[dict[str, Any]] = []
     for row in top_risk:
@@ -1772,7 +1800,7 @@ def api_security() -> dict[str, Any]:
             continue
         seen_packages.add(row["package"])
         row["security_findings"] = json.loads(row["security_findings"])
-        row["affected_variants"] = affected_counts.get(row["package"], 1)
+        row["affected_variants"] = 1
         row.update(package_intelligence(row))
         deduped_top_risk.append(row)
         if len(deduped_top_risk) >= 25:
