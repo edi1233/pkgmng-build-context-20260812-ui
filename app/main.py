@@ -327,6 +327,7 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_packages_name ON packages(package);
             CREATE INDEX IF NOT EXISTS idx_packages_status ON packages(security_status);
+            CREATE INDEX IF NOT EXISTS idx_packages_sandbox_status ON packages(sandbox_status);
             CREATE INDEX IF NOT EXISTS idx_scan_runs_started ON scan_runs(started_at);
             CREATE INDEX IF NOT EXISTS idx_scan_events_run ON scan_events(scan_run_id, id);
             CREATE INDEX IF NOT EXISTS idx_sandbox_runs_requested ON sandbox_runs(requested_at);
