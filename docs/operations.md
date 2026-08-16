@@ -519,10 +519,10 @@ Sandbox status answers a different question than security status. Security statu
 
 | Sandbox status | Meaning | Operator action |
 |---|---|---|
-| `passed` | Metadata preflight found no sandbox trigger. | Keep under normal monitoring. No dynamic execution is required by current checks. |
-| `review` | Package affects a high-impact area or suggests install-time behavior. | Run it in an isolated disposable host lane and inspect install scripts, file writes, service changes, network access, capabilities, and privileged execution. |
-| `failed` | Package failed blocking identity checks. | Do not execute it. Quarantine or fix checksum/type/size metadata first, then rescan. |
-| `pending` | Existing row has not been rescanned since sandbox fields were added. | Run a scan or refresh to backfill sandbox evidence. |
+| `passed` / **Preflight passed** | Metadata preflight found no sandbox trigger. | Keep under normal monitoring. No dynamic execution is required by current checks. |
+| `review` / **Needs dynamic test** | Package affects a high-impact area or suggests install-time behavior. This is not a failed scan; it means the package needs runtime evidence before promotion. | Run it in an isolated disposable host lane and inspect install scripts, file writes, service changes, network access, capabilities, and privileged execution. |
+| `failed` / **Blocked** | Package failed blocking identity checks. | Do not execute it. Quarantine or fix checksum/type/size metadata first, then rescan. |
+| `pending` / **Not checked** | Existing row has not been rescanned since sandbox fields were added. | Run a scan or refresh to backfill sandbox evidence. |
 
 Use the Package intelligence table filter `Sandbox = Needs sandbox` to review `sandbox_status=review` packages. Open a package row to see:
 

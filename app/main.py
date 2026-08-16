@@ -1053,6 +1053,44 @@ def security_totals(conn: sqlite3.Connection) -> dict[str, Any]:
     )
 
 
+def sandbox_totals(conn: sqlite3.Connection) -> dict[str, Any]:
+    row = conn.execute(
+        """
+        SELECT
+          COUNT(*) total,
+          COALESCE(SUM(sandbox_status='passed'), 0) passed,
+          COALESCE(SUM(sandbox_status='review'), 0) review,
+          COALESCE(SUM(sandbox_status='failed'), 0) failed,
+          COALESCE(SUM(sandbox_status='pending'), 0) pending
+        FROM packages
+        """
+    ).fetchone()
+    total = int(row["total"] or 0)
+    review = int(row["review"] or 0)
+    failed = int(row["failed"] or 0)
+    pending = int(row["pending"] or 0)
+    if failed:
+        next_action = "Resolve blocked package identity metadata before any package execution."
+    elif review:
+        next_action = "Run dynamic sandbox workers for packages marked Needs dynamic test before promotion."
+    elif pending:
+        next_action = "Run sandbox preflight to backfill packages that have not been checked yet."
+    elif total:
+        next_action = "All indexed packages passed metadata preflight; keep scheduled monitoring enabled."
+    else:
+        next_action = "Index repository sources before running sandbox preflight."
+    return {
+        "total": total,
+        "passed": int(row["passed"] or 0),
+        "review": review,
+        "failed": failed,
+        "pending": pending,
+        "next_action": next_action,
+        "mode": "metadata-preflight",
+        "dynamic_execution": "not-run-in-web-pod",
+    }
+
+
 def latest_scan_totals(conn: sqlite3.Connection) -> dict[str, Any]:
     row = conn.execute(
         """
@@ -1078,6 +1116,7 @@ def latest_scan_totals(conn: sqlite3.Connection) -> dict[str, Any]:
             "avg_risk": 0,
         }
     severity = row["highest_severity"] or "none"
+    sandbox = sandbox_totals(conn)
     return {
         "total": row["packages_total"] or 0,
         "passed": row["passed"] or 0,
@@ -1086,9 +1125,10 @@ def latest_scan_totals(conn: sqlite3.Connection) -> dict[str, Any]:
         "critical": 1 if severity == "critical" else 0,
         "high": 1 if severity == "high" else 0,
         "medium": 1 if severity == "medium" else 0,
-        "sandbox_passed": 0,
-        "sandbox_review": 0,
-        "sandbox_failed": 0,
+        "sandbox_passed": sandbox["passed"],
+        "sandbox_review": sandbox["review"],
+        "sandbox_failed": sandbox["failed"],
+        "sandbox_pending": sandbox["pending"],
         "avg_risk": 0,
     }
 
@@ -1759,17 +1799,12 @@ def api_sandbox_scans(limit: int = Query(10, ge=1, le=50)) -> dict[str, Any]:
     with closing(connect_db()) as conn:
         targeted_runs = sandbox_run_rows(conn, limit)
         package_logs = sandbox_package_log_rows(conn, limit=limit)
+        totals = sandbox_totals(conn)
     return {
         **payload,
         "targeted_runs": targeted_runs,
         "package_logs": package_logs,
-        "sandbox": {
-            "passed": 0,
-            "review": 0,
-            "failed": 0,
-            "pending": 0,
-            "next_action": "Start on-demand sandbox preflight after source edits, package refreshes, or remediation changes. Dynamic execution belongs in a disposable worker lane.",
-        },
+        "sandbox": totals,
     }
 
 
@@ -2617,6 +2652,26 @@ def dashboard_html() -> str:
     const skeletonRows = () => Array.from({length: 8}).map(() => '<tr><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td><td><div class="skeleton"></div></td></tr>').join('');
     const skeletonCards = () => Array.from({length: 4}).map(() => '<article class="package-card"><div class="skeleton"></div><br><div class="skeleton"></div><br><div class="skeleton"></div></article>').join('');
     const statusClass = (value) => ['passed', 'review', 'failed', 'pending'].includes(value) ? value : 'pending';
+    const sandboxClass = (value) => ({ passed: 'passed', review: 'review', failed: 'failed', pending: 'pending' }[value] || 'pending');
+    const sandboxLabel = (value) => ({
+      passed: 'Preflight passed',
+      review: 'Needs dynamic test',
+      failed: 'Blocked',
+      pending: 'Not checked'
+    }[value] || 'Not checked');
+    const sandboxShortLabel = (value) => ({
+      passed: 'Passed',
+      review: 'Needs test',
+      failed: 'Blocked',
+      pending: 'Pending'
+    }[value] || 'Pending');
+    const scanStatusLabel = (value) => ({
+      succeeded: 'Completed',
+      running: 'Running',
+      degraded: 'Completed with errors',
+      failed: 'Failed',
+      queued: 'Queued'
+    }[value] || value || 'Unknown');
     const n = (value) => Number(value || 0).toLocaleString();
     const insightCell = (text, label) => {
       const value = String(text || 'none');
@@ -2676,7 +2731,7 @@ def dashboard_html() -> str:
       const lanes = (security.by_family || []).slice(0, 10).map(row => `<div class="risk-item"><strong>${esc(row.distro_family)} v${esc(row.release_version || 'n/a')}</strong><span>${n(row.review)} review / ${n(row.failed)} failed</span></div>`).join('');
       const topRisk = (security.top_risk || []).slice(0, 8).map(row => `<div class="risk-item"><strong>${esc(row.package)}</strong><span>${esc(row.security_severity)} - ${n(row.security_risk_score)} / ${n(row.affected_variants || 1)} variants</span></div>`).join('');
       $('security').innerHTML = `<article class="security-panel"><div class="eyebrow">Average risk</div><h3>${avgRisk.toFixed(1)} / 100</h3><div class="risk-meter"><span style="width:${avgRisk}%"></span></div><p class="muted">${n(securityTotals.total)} packages scanned, ${n(securityTotals.critical)} critical metadata failures, ${n(securityTotals.high)} high review signals.</p><div class="risk-list">${lanes || '<div class="risk-item"><strong>No scan data</strong><span>refresh index</span></div>'}</div></article><article class="security-panel"><div class="eyebrow">Highest risk packages</div><h3>Validation queue</h3><div class="risk-list">${topRisk || '<div class="risk-item"><strong>No packages need review</strong><span>clear</span></div>'}</div></article>`;
-      $('sandbox-summary').innerHTML = `<article class="security-panel"><div class="eyebrow">Sandbox preflight</div><h3>${n(securityTotals.sandbox_review + securityTotals.sandbox_failed)} need action</h3><div class="risk-list"><div class="risk-item"><strong>Passed preflight</strong><span>${n(securityTotals.sandbox_passed)}</span></div><div class="risk-item"><strong>Needs dynamic sandbox</strong><span>${n(securityTotals.sandbox_review)}</span></div><div class="risk-item"><strong>Blocked before execution</strong><span>${n(securityTotals.sandbox_failed)}</span></div></div></article><article class="security-panel"><div class="eyebrow">How to proceed</div><h3>Sandbox lane</h3><p class="muted">Passed packages can stay in normal monitoring. Review packages need disposable-host install/remove observation. Blocked packages must first fix checksum, size, or artifact identity before any execution.</p><div class="scan-actions"><button class="ghost" id="sandbox-review-inline">Needs sandbox ${icon('arrow')}</button><button class="ghost" id="sandbox-blocked-inline">Blocked ${icon('arrow')}</button></div></article>`;
+      $('sandbox-summary').innerHTML = `<article class="security-panel"><div class="eyebrow">Sandbox preflight</div><h3>${n(securityTotals.sandbox_review + securityTotals.sandbox_failed)} need action</h3><p class="muted">These counts are metadata preflight decisions. They do not mean dynamic package execution has already happened.</p><div class="risk-list"><div class="risk-item"><strong>Preflight passed</strong><span>${n(securityTotals.sandbox_passed)}</span></div><div class="risk-item"><strong>Needs dynamic test</strong><span>${n(securityTotals.sandbox_review)}</span></div><div class="risk-item"><strong>Blocked before execution</strong><span>${n(securityTotals.sandbox_failed)}</span></div><div class="risk-item"><strong>Not checked</strong><span>${n(securityTotals.sandbox_pending)}</span></div></div></article><article class="security-panel"><div class="eyebrow">How to proceed</div><h3>Sandbox lane</h3><p class="muted">Preflight-passed packages can stay in normal monitoring. Needs dynamic test means run disposable-host install/remove observation. Blocked packages must first fix checksum, size, or artifact identity before any execution.</p><div class="scan-actions"><button class="ghost" id="sandbox-review-inline">Needs dynamic test ${icon('arrow')}</button><button class="ghost" id="sandbox-blocked-inline">Blocked ${icon('arrow')}</button></div></article>`;
       attachSandboxSummaryFilters();
       const remediationRows = (security.top_risk || []).slice(0, 4).map(row => `<div class="remediation-item"><strong>${esc(row.package)} <span class="badge ${esc(row.security_severity)}">${esc(row.security_severity)}</span></strong><span class="muted">${esc(row.responsibility || row.category || 'Package intelligence')}</span><br><span class="muted">${esc(row.why_not_safe || (row.security_findings || []).join('; ') || 'manual review')}</span></div>`).join('');
       $('remediation').innerHTML = `<div class="eyebrow">Remediation queue</div><h3>${n(securityTotals.review + securityTotals.failed)} actions</h3><p class="muted">Open a package row to see the exact owner, priority, evidence, and fix steps for each failed or review check.</p><div class="remediation-list">${remediationRows || '<div class="remediation-item"><strong>No active remediation</strong><span class="muted">All current package checks passed.</span></div>'}</div>`;
@@ -2740,11 +2795,11 @@ def dashboard_html() -> str:
         const sandboxCurrent = sandboxOps.current || {};
         const sandboxTotals = sandboxOps.sandbox || {};
         const sandboxRunning = sandboxCurrent.status === 'running';
-        const sandboxLogRows = (sandboxOps.logs || []).map(entry => `<div class="ops-entry"><span class="badge ${statusClass(entry.status)}">${esc(entry.status)}</span><div><code>#${esc(entry.run_id)} ${esc(entry.trigger || 'unknown')}</code><p>${esc(entry.message)}</p><p>${esc(entry.timestamp || 'no timestamp')}</p></div></div>`).join('');
-        const targetedRows = (sandboxOps.targeted_runs || []).map(run => `<div class="ops-entry"><span class="badge ${statusClass(run.status)}">${esc(run.status)}</span><div><code>target #${esc(run.id)} ${esc(run.trigger)}</code><p>${n(run.target_count)} selected packages: ${n(run.passed)} passed, ${n(run.review)} need sandbox, ${n(run.failed)} blocked.</p><p>${esc(run.finished_at || run.started_at || run.requested_at)}</p></div></div>`).join('');
-        const packageLogRows = (sandboxOps.package_logs || []).map(log => `<div class="ops-entry"><span class="badge ${statusClass(log.status)}">${esc(log.status)}</span><div><code>${esc(log.package)} ${esc(log.version)} ${esc(log.architecture || '')}</code><p>${esc(log.verdict)} - ${esc(log.next_action)}</p><p>repo ${esc(log.repo_name)} · run #${esc(log.sandbox_run_id)}</p></div></div>`).join('');
-        $('sandbox-queue').innerHTML = `<div class="eyebrow">Sandbox run queue</div><h3>${sandboxRunning ? 'Sandbox scan running' : 'Ready for on-demand scan'}</h3><p class="muted">${sandboxRunning ? esc(sandboxCurrent.notes || 'The current sandbox preflight is recalculating package evidence.') : esc(sandboxTotals.next_action || 'Start sandbox preflight after source edits or remediation changes.')}</p><div class="risk-list"><div class="risk-item"><strong>Passed preflight</strong><span>${n(sandboxTotals.passed)}</span></div><div class="risk-item"><strong>Needs sandbox</strong><span>${n(sandboxTotals.review)}</span></div><div class="risk-item"><strong>Blocked</strong><span>${n(sandboxTotals.failed)}</span></div><div class="risk-item"><strong>Pending backfill</strong><span>${n(sandboxTotals.pending)}</span></div></div><div class="scan-actions"><button id="run-sandbox-inline">${sandboxRunning ? 'Scan running' : 'Start sandbox preflight'} ${icon(sandboxRunning ? 'refresh' : 'play')}</button><button class="secondary" id="run-selected-sandbox-inline">Sandbox selected ${icon('play')}</button><button class="ghost" id="clear-selected-inline">Clear selected ${icon('refresh')}</button><button class="ghost" id="sandbox-refresh-inline">Refresh status ${icon('refresh')}</button><span class="selected-state" id="selected-package-count">${n(selectedPackageIds.size)} selected</span></div><p class="muted" id="sandbox-action-state" aria-live="polite">Select up to 20 package rows to sandbox only those RPM/DEB records.</p>`;
-        $('sandbox-logs').innerHTML = `<div class="eyebrow">Sandbox operation logs</div><h3>Queue, targeted runs, and package evidence</h3><p class="muted">Logs include full scan-run records plus targeted package sandbox records: status, verdict, evidence, and next action for each selected package.</p><div class="scan-actions"><button class="ghost" id="sandbox-pending-inline">Pending ${icon('arrow')}</button><button class="ghost" id="sandbox-review-log-inline">Needs sandbox ${icon('arrow')}</button><button class="ghost" id="sandbox-failed-log-inline">Blocked ${icon('arrow')}</button></div><div class="ops-log">${targetedRows || packageLogRows || sandboxLogRows || '<div class="ops-entry"><span class="badge pending">pending</span><div><code>No sandbox runs</code><p>Start sandbox preflight or select package rows to create operation logs.</p></div></div>'}</div>`;
+        const sandboxLogRows = (sandboxOps.logs || []).map(entry => `<div class="ops-entry"><span class="badge ${statusClass(entry.status)}">${esc(scanStatusLabel(entry.status))}</span><div><code>#${esc(entry.run_id)} ${esc(entry.trigger || 'unknown')}</code><p>${esc(entry.message)}</p><p>${esc(entry.timestamp || 'no timestamp')}</p></div></div>`).join('');
+        const targetedRows = (sandboxOps.targeted_runs || []).map(run => `<div class="ops-entry"><span class="badge ${statusClass(run.status)}">${esc(scanStatusLabel(run.status))}</span><div><code>target #${esc(run.id)} ${esc(run.trigger)}</code><p>${n(run.target_count)} selected packages: ${n(run.passed)} preflight passed, ${n(run.review)} need dynamic test, ${n(run.failed)} blocked.</p><p>${esc(run.finished_at || run.started_at || run.requested_at)}</p></div></div>`).join('');
+        const packageLogRows = (sandboxOps.package_logs || []).map(log => `<div class="ops-entry"><span class="badge ${sandboxClass(log.status)}">${esc(sandboxLabel(log.status))}</span><div><code>${esc(log.package)} ${esc(log.version)} ${esc(log.architecture || '')}</code><p>${esc(log.verdict)} - ${esc(log.next_action)}</p><p>repo ${esc(log.repo_name)} · run #${esc(log.sandbox_run_id)}</p></div></div>`).join('');
+        $('sandbox-queue').innerHTML = `<div class="eyebrow">Sandbox run queue</div><h3>${sandboxRunning ? 'Preflight running' : 'Ready for on-demand preflight'}</h3><p class="muted">${sandboxRunning ? esc(sandboxCurrent.notes || 'The current metadata preflight is recalculating package evidence.') : esc(sandboxTotals.next_action || 'Start sandbox preflight after source edits or remediation changes.')}</p><p class="muted">Mode: metadata preflight. Dynamic package execution is not run inside the web pod.</p><div class="risk-list"><div class="risk-item"><strong>Preflight passed</strong><span>${n(sandboxTotals.passed)}</span></div><div class="risk-item"><strong>Needs dynamic test</strong><span>${n(sandboxTotals.review)}</span></div><div class="risk-item"><strong>Blocked</strong><span>${n(sandboxTotals.failed)}</span></div><div class="risk-item"><strong>Not checked</strong><span>${n(sandboxTotals.pending)}</span></div></div><div class="scan-actions"><button id="run-sandbox-inline">${sandboxRunning ? 'Preflight running' : 'Start preflight'} ${icon(sandboxRunning ? 'refresh' : 'play')}</button><button class="secondary" id="run-selected-sandbox-inline">Preflight selected ${icon('play')}</button><button class="ghost" id="clear-selected-inline">Clear selected ${icon('refresh')}</button><button class="ghost" id="sandbox-refresh-inline">Refresh status ${icon('refresh')}</button><span class="selected-state" id="selected-package-count">${n(selectedPackageIds.size)} selected</span></div><p class="muted" id="sandbox-action-state" aria-live="polite">Select up to 20 package rows to run metadata preflight only for those RPM/DEB records.</p>`;
+        $('sandbox-logs').innerHTML = `<div class="eyebrow">Sandbox operation logs</div><h3>Preflight queue, targeted runs, and package evidence</h3><p class="muted">Logs show metadata preflight decisions and targeted package records. Dynamic execution logs will appear here after disposable sandbox workers are added.</p><div class="scan-actions"><button class="ghost" id="sandbox-pending-inline">Not checked ${icon('arrow')}</button><button class="ghost" id="sandbox-review-log-inline">Needs dynamic test ${icon('arrow')}</button><button class="ghost" id="sandbox-failed-log-inline">Blocked ${icon('arrow')}</button></div><div class="ops-log">${targetedRows || packageLogRows || sandboxLogRows || '<div class="ops-entry"><span class="badge pending">Not checked</span><div><code>No sandbox runs</code><p>Start preflight or select package rows to create operation logs.</p></div></div>'}</div>`;
         $('run-sandbox-inline').disabled = sandboxRunning;
         $('run-sandbox-inline').addEventListener('click', runSandboxScan);
         $('run-selected-sandbox-inline').addEventListener('click', runSelectedSandboxScan);
@@ -2796,8 +2851,8 @@ def dashboard_html() -> str:
         renderFilterSummary(page);
         $('prev-page').disabled = page.offset <= 0;
         $('next-page').disabled = !page.has_more;
-        $('packages').innerHTML = packages.packages.length ? packages.packages.map(p => `<tr><td class="select-cell"><input type="checkbox" class="package-select" data-package-id="${esc(p.id)}" aria-label="Select ${esc(p.package)} for targeted sandbox" ${selectedPackageIds.has(String(p.id)) ? 'checked' : ''}></td><td><button class="details-button truncate" title="${esc(p.package)}" data-package-id="${esc(p.id)}">${esc(p.package)}</button><button class="insight-toggle sandbox-one" type="button" data-package-id="${esc(p.id)}">Sandbox this</button></td><td><span class="truncate" title="${esc(p.version)}">${esc(p.version)}</span></td><td><span class="truncate" title="${esc(p.repo_name)}">${esc(p.repo_name)}</span><span class="muted truncate">${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</span></td><td>${esc(p.architecture || 'n/a')}</td><td><span class="truncate" title="${esc(p.category)}">${esc(p.category)}</span><span class="muted truncate" title="${esc(p.responsibility)}">${esc(p.responsibility)}</span></td><td>${esc((p.package_format || 'deb').toUpperCase())}<br><span class="muted">${esc((p.checksum_algorithm || '').toUpperCase())}</span></td><td><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span></td><td><span class="badge ${esc(p.security_severity || 'none')}">${esc(p.security_severity || 'none')}</span></td><td>${n(p.security_risk_score)}</td><td><span class="badge ${statusClass(p.sandbox_status)}">${esc(p.sandbox_status || 'pending')}</span><br><span class="muted truncate" title="${esc(p.sandbox_verdict)}">${esc(p.sandbox_verdict || 'not scanned')}</span></td><td>${insightCell(p.why_not_safe || 'none', 'unsafe reason')}</td><td class="muted">${insightCell(p.primary_purpose || (p.description || '').split('\\n')[0], 'package purpose')}</td></tr>`).join('') : '<tr><td colspan="13"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></td></tr>';
-        $('package-cards').innerHTML = packages.packages.length ? packages.packages.map(p => `<article class="package-card"><h3><button class="details-button" data-package-id="${esc(p.id)}">${esc(p.package)}</button></h3><div class="package-meta"><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span><span class="badge ${esc(p.security_severity || 'none')}">${esc(p.security_severity || 'none')}</span><span class="badge ${statusClass(p.sandbox_status)}">sandbox ${esc(p.sandbox_status || 'pending')}</span><span class="badge pending">${esc(p.architecture || 'n/a')}</span><span class="badge pending">${esc((p.package_format || 'deb').toUpperCase())}</span></div><dl><div><dt>Version</dt><dd>${esc(p.version)}</dd></div><div><dt>Repo</dt><dd>${esc(p.repo_name)} · ${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</dd></div><div><dt>Responsible for</dt><dd>${esc(p.responsibility)}</dd></div><div><dt>Sandbox verdict</dt><dd>${esc(p.sandbox_verdict || 'not scanned')}</dd></div><div><dt>Why unsafe</dt><dd>${insightCell(p.why_not_safe || 'none', 'unsafe reason')}</dd></div><div><dt>Purpose</dt><dd>${insightCell(p.primary_purpose || (p.description || '').split('\\n')[0], 'package purpose')}</dd></div></dl></article>`).join('') : '<article class="package-card"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></article>';
+        $('packages').innerHTML = packages.packages.length ? packages.packages.map(p => `<tr><td class="select-cell"><input type="checkbox" class="package-select" data-package-id="${esc(p.id)}" aria-label="Select ${esc(p.package)} for targeted sandbox preflight" ${selectedPackageIds.has(String(p.id)) ? 'checked' : ''}></td><td><button class="details-button truncate" title="${esc(p.package)}" data-package-id="${esc(p.id)}">${esc(p.package)}</button><button class="insight-toggle sandbox-one" type="button" data-package-id="${esc(p.id)}">Preflight this</button></td><td><span class="truncate" title="${esc(p.version)}">${esc(p.version)}</span></td><td><span class="truncate" title="${esc(p.repo_name)}">${esc(p.repo_name)}</span><span class="muted truncate">${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</span></td><td>${esc(p.architecture || 'n/a')}</td><td><span class="truncate" title="${esc(p.category)}">${esc(p.category)}</span><span class="muted truncate" title="${esc(p.responsibility)}">${esc(p.responsibility)}</span></td><td>${esc((p.package_format || 'deb').toUpperCase())}<br><span class="muted">${esc((p.checksum_algorithm || '').toUpperCase())}</span></td><td><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span></td><td><span class="badge ${esc(p.security_severity || 'none')}">${esc(p.security_severity || 'none')}</span></td><td>${n(p.security_risk_score)}</td><td><span class="badge ${sandboxClass(p.sandbox_status)}">${esc(sandboxShortLabel(p.sandbox_status))}</span><br><span class="muted truncate" title="${esc(p.sandbox_verdict)}">${esc(p.sandbox_verdict || 'not checked')}</span></td><td>${insightCell(p.why_not_safe || 'none', 'unsafe reason')}</td><td class="muted">${insightCell(p.primary_purpose || (p.description || '').split('\\n')[0], 'package purpose')}</td></tr>`).join('') : '<tr><td colspan="13"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></td></tr>';
+        $('package-cards').innerHTML = packages.packages.length ? packages.packages.map(p => `<article class="package-card"><h3><button class="details-button" data-package-id="${esc(p.id)}">${esc(p.package)}</button></h3><div class="package-meta"><span class="badge ${statusClass(p.security_status)}">${esc(p.security_status)}</span><span class="badge ${esc(p.security_severity || 'none')}">${esc(p.security_severity || 'none')}</span><span class="badge ${sandboxClass(p.sandbox_status)}">sandbox ${esc(sandboxShortLabel(p.sandbox_status))}</span><span class="badge pending">${esc(p.architecture || 'n/a')}</span><span class="badge pending">${esc((p.package_format || 'deb').toUpperCase())}</span></div><dl><div><dt>Version</dt><dd>${esc(p.version)}</dd></div><div><dt>Repo</dt><dd>${esc(p.repo_name)} · ${esc(p.distro_family)} v${esc(p.release_version || 'n/a')}</dd></div><div><dt>Responsible for</dt><dd>${esc(p.responsibility)}</dd></div><div><dt>Sandbox state</dt><dd>${esc(sandboxLabel(p.sandbox_status))}</dd></div><div><dt>Sandbox verdict</dt><dd>${esc(p.sandbox_verdict || 'not checked')}</dd></div><div><dt>Why unsafe</dt><dd>${insightCell(p.why_not_safe || 'none', 'unsafe reason')}</dd></div><div><dt>Purpose</dt><dd>${insightCell(p.primary_purpose || (p.description || '').split('\\n')[0], 'package purpose')}</dd></div></dl></article>`).join('') : '<article class="package-card"><div class="state"><strong>No packages match this filter</strong>Refresh repositories or widen the search criteria.</div></article>';
         document.querySelectorAll('.details-button').forEach(button => button.addEventListener('click', () => showPackage(button.dataset.packageId)));
         document.querySelectorAll('.package-select').forEach(input => input.addEventListener('change', () => {
           if (input.checked) {
@@ -2914,8 +2969,8 @@ def dashboard_html() -> str:
       const steps = (p.remediation || []).map(item => `<div class="remediation-item"><strong>${esc(item.action)} <span class="badge ${esc(item.priority === 'urgent' ? 'critical' : item.priority === 'high' ? 'high' : 'medium')}">${esc(item.priority)}</span></strong><span class="muted">${esc(item.owner)} - ${esc(item.evidence || '')}</span><ol>${(item.steps || []).map(step => `<li>${esc(step)}</li>`).join('')}</ol></div>`).join('');
       const sandboxEvidence = (p.sandbox_evidence || []).map(item => `<li>${esc(item)}</li>`).join('');
       const sandboxFindings = (p.sandbox_findings || []).map(item => `<li>${esc(item)}</li>`).join('');
-      const packageLogs = (logPayload.logs || []).map(log => `<div class="remediation-item"><strong>Run #${esc(log.sandbox_run_id)} <span class="badge ${statusClass(log.status)}">${esc(log.status)}</span></strong><span class="muted">${esc(log.created_at)} - ${esc(log.verdict)}</span><ol>${(log.evidence || []).map(item => `<li>${esc(item)}</li>`).join('')}</ol></div>`).join('');
-      $('remediation').innerHTML = `<div class="eyebrow">Package intelligence</div><h3>${esc(p.package)}</h3><div class="scan-actions"><button id="sandbox-package-detail">Sandbox this package ${icon('play')}</button></div><div class="package-brief"><div class="brief-row"><span>Responsible for</span><strong>${esc(p.responsibility)}</strong></div><div class="brief-row"><span>Package purpose</span><strong>${esc(p.primary_purpose)}</strong></div><div class="brief-row"><span>Why it is not safe</span><strong>${esc(p.why_not_safe)}</strong></div><div class="brief-row"><span>Sandbox verdict</span><strong><span class="badge ${statusClass(p.sandbox_status)}">${esc(p.sandbox_status || 'pending')}</span> ${esc(p.sandbox_verdict || 'not scanned')}</strong></div><div class="brief-row"><span>Sandbox next action</span><strong>${esc(p.sandbox_next_action || 'No sandbox action recorded.')}</strong></div><div class="brief-row"><span>Internal owner lane</span><strong>${esc(p.operational_owner)}</strong></div><div class="brief-row"><span>Upstream maintainer from package metadata</span><strong>${esc(p.upstream_maintainer)}</strong></div><div class="brief-row"><span>Architecture</span><strong>${esc(p.architecture || 'n/a')}</strong></div><div class="brief-row"><span>Checksum algorithm</span><strong>${esc((p.checksum_algorithm || 'unknown').toUpperCase())}</strong></div><div class="brief-row"><span>Impact</span><strong>${esc(p.impact)}</strong></div></div><p class="muted">${esc(p.recommended_action)}</p><div class="remediation-list"><div class="remediation-item"><strong>Sandbox evidence</strong><ol>${sandboxEvidence || '<li>No sandbox evidence recorded.</li>'}</ol>${sandboxFindings ? `<strong>Sandbox findings</strong><ol>${sandboxFindings}</ol>` : ''}</div><div class="remediation-item"><strong>Sandbox package logs</strong><span class="muted">Every targeted run for this package is retained here.</span></div>${packageLogs || '<div class="remediation-item"><strong>No targeted package logs yet</strong><span class="muted">Use Sandbox this package to create the first per-package log.</span></div>'}${steps || '<div class="remediation-item"><strong>No remediation required</strong><span class="muted">This package currently passes validation.</span></div>'}</div>`;
+      const packageLogs = (logPayload.logs || []).map(log => `<div class="remediation-item"><strong>Run #${esc(log.sandbox_run_id)} <span class="badge ${sandboxClass(log.status)}">${esc(sandboxLabel(log.status))}</span></strong><span class="muted">${esc(log.created_at)} - ${esc(log.verdict)}</span><ol>${(log.evidence || []).map(item => `<li>${esc(item)}</li>`).join('')}</ol></div>`).join('');
+      $('remediation').innerHTML = `<div class="eyebrow">Package intelligence</div><h3>${esc(p.package)}</h3><div class="scan-actions"><button id="sandbox-package-detail">Run preflight for this package ${icon('play')}</button></div><div class="package-brief"><div class="brief-row"><span>Responsible for</span><strong>${esc(p.responsibility)}</strong></div><div class="brief-row"><span>Package purpose</span><strong>${esc(p.primary_purpose)}</strong></div><div class="brief-row"><span>Why it is not safe</span><strong>${esc(p.why_not_safe)}</strong></div><div class="brief-row"><span>Sandbox state</span><strong><span class="badge ${sandboxClass(p.sandbox_status)}">${esc(sandboxLabel(p.sandbox_status))}</span> ${esc(p.sandbox_verdict || 'not checked')}</strong></div><div class="brief-row"><span>Sandbox next action</span><strong>${esc(p.sandbox_next_action || 'No sandbox action recorded.')}</strong></div><div class="brief-row"><span>Internal owner lane</span><strong>${esc(p.operational_owner)}</strong></div><div class="brief-row"><span>Upstream maintainer from package metadata</span><strong>${esc(p.upstream_maintainer)}</strong></div><div class="brief-row"><span>Architecture</span><strong>${esc(p.architecture || 'n/a')}</strong></div><div class="brief-row"><span>Checksum algorithm</span><strong>${esc((p.checksum_algorithm || 'unknown').toUpperCase())}</strong></div><div class="brief-row"><span>Impact</span><strong>${esc(p.impact)}</strong></div></div><p class="muted">${esc(p.recommended_action)}</p><div class="remediation-list"><div class="remediation-item"><strong>Sandbox evidence</strong><span class="muted">Metadata preflight evidence. Dynamic execution evidence belongs to future disposable sandbox workers.</span><ol>${sandboxEvidence || '<li>No sandbox evidence recorded.</li>'}</ol>${sandboxFindings ? `<strong>Sandbox findings</strong><ol>${sandboxFindings}</ol>` : ''}</div><div class="remediation-item"><strong>Sandbox package logs</strong><span class="muted">Every targeted preflight run for this package is retained here.</span></div>${packageLogs || '<div class="remediation-item"><strong>No targeted package logs yet</strong><span class="muted">Use Run preflight for this package to create the first per-package log.</span></div>'}${steps || '<div class="remediation-item"><strong>No remediation required</strong><span class="muted">This package currently passes validation.</span></div>'}</div>`;
       $('sandbox-package-detail').addEventListener('click', () => runTargetedSandbox([packageId]));
       document.querySelector('.scan-console').scrollIntoView({ behavior: 'smooth', block: 'start' });
     }

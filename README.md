@@ -46,6 +46,16 @@ The UI exposes a distribution-family summary, version lanes, and package filters
 
 For Kubernetes operation, repository-source management, OS-level client setup, and exposure choices, see [docs/operations.md](docs/operations.md).
 
+## LLM wiki
+
+This project includes a persistent markdown LLM wiki under [llm-wiki](llm-wiki/index.md), based on the raw-sources/generated-wiki/schema pattern from Karpathy's LLM Wiki idea file.
+
+Start with:
+
+- [llm-wiki/index.md](llm-wiki/index.md) for the page catalog.
+- [llm-wiki/SCHEMA.md](llm-wiki/SCHEMA.md) for maintenance rules.
+- [llm-wiki/raw/sources.md](llm-wiki/raw/sources.md) for source evidence.
+
 Repository sources are first-class platform records:
 
 - `GET /api/repos` lists configured APT and RPM sources with mirror health and package counts.
@@ -96,9 +106,10 @@ Every package also receives a sandbox preflight profile:
 
 | Field | Meaning |
 |---|---|
-| `sandbox_status=passed` | Metadata preflight found no behavior trigger. Keep the package under normal scheduled monitoring. |
-| `sandbox_status=review` | The package should be installed and removed in an isolated disposable host lane before production promotion. |
-| `sandbox_status=failed` | Do not execute the package yet. Fix blocking identity metadata such as checksum, type, or size first. |
+| `sandbox_status=passed` | UI label: **Preflight passed**. Metadata preflight found no behavior trigger. Keep the package under normal scheduled monitoring. |
+| `sandbox_status=review` | UI label: **Needs dynamic test**. The package should be installed and removed in an isolated disposable host lane before production promotion. This is not a failure by itself. |
+| `sandbox_status=failed` | UI label: **Blocked**. Do not execute the package yet. Fix blocking identity metadata such as checksum, type, or size first. |
+| `sandbox_status=pending` | UI label: **Not checked**. The row has not yet received sandbox preflight evidence. |
 
 Sandbox evidence explains the package format, artifact path, source repository, and reason the package did or did not need dynamic observation. `sandbox_next_action` tells the operator how to proceed. Current sandboxing is a platform decision lane and metadata preflight; dynamic binary execution should run in a disposable VM/container host lane, not inside the web app pod.
 
