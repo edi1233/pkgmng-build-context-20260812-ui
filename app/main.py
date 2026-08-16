@@ -1929,21 +1929,22 @@ def api_security() -> dict[str, Any]:
                 """
             )
         ]
-        top_risk = [
-            dict(row)
-            for row in conn.execute(
-                """
-                SELECT packages.id, packages.package, packages.version, packages.architecture, packages.repo_name, packages.security_status,
-                       packages.security_severity, packages.security_risk_score, packages.security_findings,
-                       repos.distro_family, repos.release_version
-                FROM packages
-                JOIN repos ON repos.name = packages.repo_name
-                WHERE packages.security_status IN ('failed', 'review')
-                ORDER BY packages.id ASC
-                LIMIT 50
-                """
-            )
-        ]
+        top_risk: list[dict[str, Any]] = []
+        top_risk_sql = """
+            SELECT packages.id, packages.package, packages.version, packages.architecture, packages.repo_name, packages.security_status,
+                   packages.security_severity, packages.security_risk_score, packages.security_findings,
+                   repos.distro_family, repos.release_version
+            FROM packages
+            JOIN repos ON repos.name = packages.repo_name
+            WHERE packages.security_status = ?
+            ORDER BY packages.id ASC
+            LIMIT ?
+        """
+        for status_value in ("failed", "review"):
+            remaining = 50 - len(top_risk)
+            if remaining <= 0:
+                break
+            top_risk.extend(dict(row) for row in conn.execute(top_risk_sql, (status_value, remaining)))
     seen_packages: set[str] = set()
     deduped_top_risk: list[dict[str, Any]] = []
     for row in top_risk:
